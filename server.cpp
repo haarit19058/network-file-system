@@ -47,7 +47,7 @@ enum Op : uint32_t {
     OP_UTIMENS=11, OP_STATFS=12, OP_RELEASE=13
 };
 
-int handle_one(int client, const string &root) {
+int handle_one(int client, const string &root)  {
     while (true ) {
         
         try {
