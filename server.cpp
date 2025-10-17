@@ -16,6 +16,8 @@
 #include <sys/statvfs.h>
 using namespace std;
 
+
+// Read n bytes from a file descriptor and store it in buffe r
 static int readn(int fd, void* buf, size_t n) {
     size_t left = n; char *p = (char*)buf;
     while (left) {
