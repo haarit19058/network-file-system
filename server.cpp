@@ -14,6 +14,8 @@
 #include <dirent.h>
 #include <errno.h>
 #include <sys/statvfs.h>
+#include <thread>
+
 #include "utils.cpp"
 
 using namespace std;
@@ -129,14 +131,24 @@ int main(int argc, char **argv) {
     printf("Server serving root=%s on port %d\n", root.c_str(), port);
 
     while (true) {
-        struct sockaddr_in cli; socklen_t clilen = sizeof(cli);
+        struct sockaddr_in cli;
+        socklen_t clilen = sizeof(cli);
+
         int client = accept(listenfd, (struct sockaddr*)&cli, &clilen);
-        if (client == -1) { perror("accept"); continue; }
-        printf("Client connected: %s\n", inet_ntoa(cli.sin_addr));
-        handle_one(client, root);
-        close(client);
-        printf("Client disconnected\n");
-    }
+        if (client == -1) {
+            perror("accept");
+            continue;
+        }
+
+        cout << "Client connected: " << inet_ntoa(cli.sin_addr) << std::endl;
+
+        // Create a new thread for each client
+        thread([client, root]() {
+            handle_one(client, root); // handle client requests
+            close(client);            // close client socket when done
+            cout << "Client disconnected\n";
+        }).detach(); // detach so thread cleans up automatically
+    }    
     close(listenfd);
     return 0;
 }
