@@ -154,3 +154,13 @@ int truncate_handler(const char* p, int client, const string &root) {
     send_ok_with_data(nullptr,0);
     return 0;
 }
+
+int mkdir_handler(const char* p, int client, const string& root) {
+    uint32_t pathlen; memcpy(&pathlen, p, 4); p += 4; pathlen = ntohl(pathlen);
+    string path(p, p+pathlen); p += pathlen;
+    int mode; memcpy(&mode, p, 4); p += 4; mode = ntohl(mode);
+    string full = joinpath(root, path);
+    if (mkdir(full.c_str(), mode) == -1) { send_errno(errno); continue; return 1; }
+    send_ok_with_data(nullptr,0);
+    return 0;
+}
