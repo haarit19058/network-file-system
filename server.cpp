@@ -16,33 +16,6 @@
 #include <sys/statvfs.h>
 using namespace std;
 
-
-// Read n bytes from a file descriptor and store it in buffe r
-static int readn(int fd, void* buf, size_t n) {
-    size_t left = n; char *p = (char*)buf;
-    while (left) {
-        ssize_t r = ::read(fd, p, left);
-        if (r <= 0) return r;
-        left -= r; p += r;
-    }
-    return n;
-}
-static int writen(int fd, const void* buf, size_t n) {
-    size_t left = n; const char *p = (const char*)buf;
-    while (left) {
-        ssize_t w = ::write(fd, p, left);
-        if (w <= 0) return w;
-        left -= w; p += w;
-    }
-    return n;
-}
-
-static string joinpath(const string &root, const string &path) {
-    if (path.empty() || path == "/") return root;
-    if (path[0] == '/') return root + path;
-    return root + "/" + path;
-}
-
 enum Op : uint32_t {
     OP_GETATTR=1, OP_READDIR=2, OP_OPEN=3, OP_READ=4, OP_WRITE=5,
     OP_CREATE=6, OP_UNLINK=7, OP_MKDIR=8, OP_RMDIR=9, OP_TRUNCATE=10,
