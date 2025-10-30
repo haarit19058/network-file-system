@@ -86,23 +86,6 @@ void send_ok_with_data(int client, const void *data, uint32_t dlen)
         writen(client, data, dlen);
 };
 
-bool statfs_handler(const char *p, int client, const string &root)
-{
-    uint32_t pathlen;
-    memcpy(&pathlen, p, 4);
-    p += 4;
-    pathlen = ntohl(pathlen);
-    string path(p, p + pathlen);
-    string full = joinpath(root, path);
-    struct statvfs st;
-    if (statvfs(full.c_str(), &st) == -1)
-    {
-        send_errno(client, errno);
-        return 0;
-    }
-    send_ok_with_data(client, &st, sizeof(st));
-    return 1;
-
 int getattr_handler(const char* p,int client,const string &root){
     uint32_t pathlen;
     memcpy(&pathlen, p, 4); p += 4; pathlen = ntohl(pathlen);
