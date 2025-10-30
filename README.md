@@ -5,8 +5,8 @@ Creds : chatgpt (for writing code as i told) and gfg (for teachign the basics of
 
 1. make
 2. mkdir mntdir                -- create a directory to mount the nfs filesystem
-3. ./server . 3000              -- start the server on port 3000 and tell it to use . as root dir
-4. ./nfuse ./mntdir 127.0.0.1 3000   -- tell the client to mount the directory at mntdir and connect to server at port 3000
+3. ./server.out . 3000              -- start the server on port 3000 and tell it to use . as root dir
+4. ./client.out ./mntdir 127.0.0.1 3000   -- tell the client to mount the directory at mntdir and connect to server at port 3000
 5. fusermount -u mntdir         -- after completion unmount the nfs filesystem
 
 

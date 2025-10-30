@@ -18,11 +18,6 @@
 
 using namespace std;
 
-enum Op : uint32_t {
-    OP_GETATTR=1, OP_READDIR=2, OP_OPEN=3, OP_READ=4, OP_WRITE=5,
-    OP_CREATE=6, OP_UNLINK=7, OP_MKDIR=8, OP_RMDIR=9, OP_TRUNCATE=10,
-    OP_UTIMENS=11, OP_STATFS=12, OP_RELEASE=13
-};
 
 int handle_one(int client, const string &root)  {
     while (true ) {

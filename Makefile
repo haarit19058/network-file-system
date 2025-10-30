@@ -1,17 +1,17 @@
 CXX = g++
-CXXFLAGS = -std=c++17 -O2
+CXXFLAGS = -std=c++17 
 LDFLAGS =
 # may need -pthread for fuse
 LIBS = -lfuse3
 
-all: server nfuse
+all: server client
 
 server: server.cpp
-	$(CXX) $(CXXFLAGS) server.cpp -o server
+	$(CXX) $(CXXFLAGS) server.cpp -o server.out
 
-nfuse: nfuse.cpp
-	$(CXX) $(CXXFLAGS) nfuse.cpp -o nfuse $(LIBS)
+client: client.cpp
+	$(CXX) $(CXXFLAGS) client.cpp -o client.out $(LIBS)
 
 clean:
-	rm -f server nfuse
+	rm -f server.out client.out
 
