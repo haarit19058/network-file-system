@@ -37,3 +37,35 @@ static string joinpath(const string &root, const string &path) {
     if (path[0] == '/') return root + path;
     return root + "/" + path;
 }
+
+
+
+
+
+void send_errno(int client,int eno){
+    uint32_t status = htonl((uint32_t)eno);
+    uint32_t zlen = htonl(0);
+    writen(client, &status, sizeof(status));
+    writen(client, &zlen, sizeof(zlen));
+}
+
+void send_ok_with_data(int client,const void *data, uint32_t dlen) {
+    uint32_t status = htonl(0);
+    uint32_t dlen_be = htonl(dlen);
+    writen(client, &status, sizeof(status));
+    writen(client, &dlen_be, sizeof(dlen_be));
+    if (dlen) writen(client, data, dlen);
+};
+
+
+
+
+bool statfs_handler(const char* p,int client,const string &root){
+    uint32_t pathlen; memcpy(&pathlen, p, 4); p += 4; pathlen = ntohl(pathlen);
+    string path(p, p + pathlen);
+    string full = joinpath(root, path);
+    struct statvfs st;
+    if (statvfs(full.c_str(), &st) == -1) { send_errno(client,errno); return 0; }
+    send_ok_with_data(client,&st, sizeof(st));
+    return 1;
+}
