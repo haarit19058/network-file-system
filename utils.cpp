@@ -101,3 +101,22 @@ int statfs_handler(int client,const string &root,const char* p){
     send_ok_with_data(client,&st, sizeof(st));
     return 0;
 }
+
+int rmdir_handler(const char* p, int client, const string& root) {
+    uint32_t pathlen; memcpy(&pathlen, p, 4); p += 4; pathlen = ntohl(pathlen);
+    string path(p, p+pathlen);
+    string full = joinpath(root, path);
+    if (rmdir(full.c_str()) == -1) { send_errno(errno); continue; return 1; }
+    send_ok_with_data(nullptr,0);
+    return 0;
+}
+
+int truncate_handler(const char* p, int client, const string &root) {
+    uint32_t pathlen; memcpy(&pathlen, p, 4); p += 4; pathlen = ntohl(pathlen);
+    string path(p, p+pathlen); p += pathlen;
+    uint64_t size; memcpy(&size, p, 8); p += 8; size = be64toh(size);
+    string full = joinpath(root, path);
+    if (truncate(full.c_str(), (off_t)size) == -1) { send_errno(errno); continue; return 1; }
+    send_ok_with_data(nullptr,0);
+    return 0;
+}
