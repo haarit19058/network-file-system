@@ -58,6 +58,40 @@ void send_ok_with_data(int client,const void *data, uint32_t dlen) {
 };
 
 
+int getattr_handler(const char* p,int client,const string &root){
+    uint32_t pathlen;
+    memcpy(&pathlen, p, 4); p += 4; pathlen = ntohl(pathlen);
+    string path(p, p+pathlen);
+    string full = joinpath(root, path);
+    struct stat st;
+    if (lstat(full.c_str(), &st) == -1) { send_errno(client,errno); return 1; }
+    // send struct stat as bytes
+    send_ok_with_data(&st, sizeof(st));
+    return 0;
+}
+
+int readdir_handler(const char* p,int client,const string &root){
+    uint32_t pathlen;
+    memcpy(&pathlen, p, 4); p += 4; pathlen = ntohl(pathlen);
+    string path(p, p+pathlen);
+    string full = joinpath(root, path);
+    DIR *d = opendir(full.c_str());
+    if (!d) { send_errno(client,errno) return 1; }
+    // produce list: entries separated by '\0' with entry type char as first byte: 'f'/'d'/'l'
+    string out;
+    struct dirent *e;
+    while ((e = readdir(d))) {
+        if (strcmp(e->d_name, ".")==0 || strcmp(e->d_name,"..")==0) continue;
+        string name = e->d_name;
+        string ent = name;
+        out.push_back('\0'); // delimiter zero to make parse simple: we'll send count then names
+        out += ent;
+    }
+    closedir(d);
+    // to make parsing easier, we will send as many names concatenated separated by '\0'
+    send_ok_with_data(out.data(), out.size());
+    return 0;
+}
 
 
 bool statfs_handler(const char* p,int client,const string &root){
