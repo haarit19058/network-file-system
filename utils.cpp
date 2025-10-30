@@ -13,8 +13,6 @@
 using namespace std;
 
 
-
-
 // -------------------------------utility functions ---------------------------------------------
 
 static string joinpath(const string &root, const string &path) {
@@ -102,40 +100,4 @@ int statfs_handler(int client,const string &root,const char* p){
     if (statvfs(full.c_str(), &st) == -1) { send_errno(client,errno); return 1; }
     send_ok_with_data(client,&st, sizeof(st));
     return 0;
-}
-
-int rmdir_handler(const char* p, int client, const string& root) {
-    uint32_t pathlen; memcpy(&pathlen, p, 4); p += 4; pathlen = ntohl(pathlen);
-    string path(p, p+pathlen);
-    string full = joinpath(root, path);
-    if (rmdir(full.c_str()) == -1) { send_errno(errno); continue; return 0; }
-    send_ok_with_data(nullptr,0);
-    return 1;
-}
-
-int truncate_handler(const char* p, int client, const string &root) {
-    uint32_t pathlen; memcpy(&pathlen, p, 4); p += 4; pathlen = ntohl(pathlen);
-    string path(p, p+pathlen); p += pathlen;
-    uint64_t size; memcpy(&size, p, 8); p += 8; size = be64toh(size);
-    string full = joinpath(root, path);
-    if (truncate(full.c_str(), (off_t)size) == -1) { send_errno(errno); continue; return 0; }
-    send_ok_with_data(nullptr,0);
-    return 1;
-}
-
-int utimens_handler(const char* p, int client, const string& root) {
-    uint32_t pathlen; memcpy(&pathlen, p, 4); p += 4; pathlen = ntohl(pathlen);
-    string path(p, p+pathlen); p += pathlen;
-    uint64_t at_sec, at_nsec, mt_sec, mt_nsec;
-    memcpy(&at_sec, p, 8); p+=8; at_sec = be64toh(at_sec);
-    memcpy(&at_nsec, p, 8); p+=8; at_nsec = be64toh(at_nsec);
-    memcpy(&mt_sec, p, 8); p+=8; mt_sec = be64toh(mt_sec);
-    memcpy(&mt_nsec, p, 8); p+=8; mt_nsec = be64toh(mt_nsec);
-    struct timespec times[2];
-    times[0].tv_sec = (time_t)at_sec; times[0].tv_nsec = (long)at_nsec;
-    times[1].tv_sec = (time_t)mt_sec; times[1].tv_nsec = (long)mt_nsec;
-    string full = joinpath(root, path);
-    if (utimensat(AT_FDCWD, full.c_str(), times, AT_SYMLINK_NOFOLLOW) == -1) { send_errno(errno); continue; return 0; }
-    send_ok_with_data(nullptr,0);
-    return 1;
 }
