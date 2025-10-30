@@ -53,23 +53,66 @@ int handle_one(int client, const string &root)  {
         try {
             switch (op)
             {
-            
+            case OP_GETATTR:
+                if (getattr_handler(client, root, p)) continue;
+                break;
+
+            case OP_READDIR:
+                if (readdir_handler(client, root, p)) continue;
+                break;
+
+            case OP_OPEN:
+                if (open_create_handler(client, root, p, op)) continue;
+                break;
+
+            case OP_READ:
+                if (read_handler(client, root, p)) continue;
+                break;
+
+            case OP_WRITE:
+                if (write_handler(client, root, p)) continue;
+                break;
+
+            case OP_CREATE:
+                if (open_create_handler(client, root, p, op)) continue;
+                break;
+
+            case OP_UNLINK:
+                if (unlink_handler(client, root, p)) continue;
+                break;
+
+            case OP_MKDIR:
+                if (mkdir_handler(client, root, p)) continue;
+                break;
+
+            case OP_RMDIR:
+                if (rmdir_handler(client, root, p)) continue;
+                break;
+
+            case OP_TRUNCATE:
+                if (truncate_handler(client, root, p)) continue;
+                break;
+
             case OP_UTIMENS:
-                if(utimens_handler(client,root,p))continue;
+                if (utimens_handler(client, root, p)) continue;
                 break;
 
             case OP_STATFS:
-                if(statfs_handler(client,root,p))continue;
+                if (statfs_handler(client, root, p)) continue;
+                break;
+
+            case OP_RELEASE:
+                if (release_handler(client, root, p)) continue;
                 break;
             
             default:
-                send_errno(client,EINVAL);
+                send_errno(client, EINVAL);
                 break;
             }
-
-        } catch(...) {
-            send_errno(client,EIO);
+        } catch (...) {
+            send_errno(client, EIO);
         }
+
     }
     return 0;
 }
