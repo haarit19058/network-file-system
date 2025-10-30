@@ -14,6 +14,8 @@
 #include <dirent.h>
 #include <errno.h>
 #include <sys/statvfs.h>
+#include "utils.cpp"
+
 using namespace std;
 
 enum Op : uint32_t {
@@ -25,36 +27,48 @@ enum Op : uint32_t {
 int handle_one(int client, const string &root)  {
     while (true ) {
         
+        uint32_t len_be;
+
+        // Read the first 4 bytes from the client: message length in network byte order (big-endian)
+        if (readn(client, &len_be, sizeof(len_be)) != sizeof(len_be)) return 0;
+
+        uint32_t len = ntohl(len_be); // convert length to host byte order
+        if (len < 4) return 0;        // minimum length must include opcode
+
+        // Allocate buffer to hold the entire message
+        vector<char> buf(len);
+
+        // Read the full message into buffer
+        if (readn(client, buf.data(), len) != (int)len) return 0;
+
+        const char *p = buf.data();   // pointer to traverse the payload
+        uint32_t op;
+
+        // Extract the operation code (first 4 bytes of the message)
+        memcpy(&op, p, 4); 
+        p += 4;           // move pointer past the opcode
+        op = ntohl(op);   // convert opcode to host byte order
+
+
         try {
-            if (op == OP_GETATTR) {
-                
-            } else if (op == OP_READDIR) {
-                
-            } else if (op == OP_OPEN || op == OP_CREATE) {
-                
-            } else if (op == OP_READ) {
-                
-            } else if (op == OP_WRITE) {
-                
-            } else if (op == OP_RELEASE) {
-                
-            } else if (op == OP_UNLINK) {
-                
-            } else if (op == OP_MKDIR) {
-                
-            } else if (op == OP_RMDIR) {
-                
-            } else if (op == OP_TRUNCATE) {
-                
-            } else if (op == OP_UTIMENS) {
-                
-            } else if (op == OP_STATFS) {
-                
-            } else {
-                send_errno(EINVAL);
+            switch (op)
+            {
+            
+            case OP_UTIMENS:
+                if(utimens_handler(client,root,p))continue;
+                break;
+
+            case OP_STATFS:
+                if(statfs_handler(client,root,p))continue;
+                break;
+            
+            default:
+                send_errno(client,EINVAL);
+                break;
             }
+
         } catch(...) {
-            send_errno(EIO);
+            send_errno(client,EIO);
         }
     }
     return 0;
