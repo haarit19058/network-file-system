@@ -13,8 +13,6 @@
 using namespace std;
 
 
-
-
 // -------------------------------utility functions ---------------------------------------------
 
 static string joinpath(const string &root, const string &path) {
