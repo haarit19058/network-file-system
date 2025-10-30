@@ -136,6 +136,48 @@ int statfs_handler(int client,const string &root,const char* p){
     return 0;
 }
 
+int write_handler(const char* p, int client, const string &root) {
+    uint32_t pathlen;
+    memcpy(&pathlen, p, 4); p += 4; pathlen = ntohl(pathlen);
+    string path(p, p + pathlen); p += pathlen;
+    uint64_t offset;
+    memcpy(&offset, p, 8); p += 8; offset = be64toh(offset);
+    uint32_t size;
+    memcpy(&size, p, 4); p += 4; size = ntohl(size);
+    string full = joinpath(root, path);
+    int fd = open(full.c_str(), O_WRONLY);
+    if (fd == -1) { send_errno(client, errno); return 1; }
+    ssize_t w = pwrite(fd, p, size, offset);
+    if (w < 0) { send_errno(client, errno); close(fd); return 1; }
+    uint32_t written = htonl((uint32_t)w);
+    send_ok_with_data(client, &written, sizeof(written));
+    return 0;
+}
+
+int release_handler(int client, const string &root, const char *p) {
+    uint32_t pathlen;
+    memcpy(&pathlen, p, 4);
+    p += 4;
+    pathlen = ntohl(pathlen);
+    string path(p, p + pathlen);
+    string full = joinpath(root, path);
+    send_ok_with_data(client, nullptr, 0);
+    return 0;
+}
+
+int unlink_handler(const char* p, int client, const string &root) {
+    uint32_t pathlen;
+    memcpy(&pathlen, p, 4); p += 4; pathlen = ntohl(pathlen);
+    string path(p, p + pathlen);
+    string full = joinpath(root, path);
+    if (unlink(full.c_str()) == -1) {
+        send_errno(client, errno);
+        return 1;
+    }
+    send_ok_with_data(client, nullptr, 0);
+    return 0;
+}
+
 int rmdir_handler(const char* p, int client, const string& root) {
     uint32_t pathlen; memcpy(&pathlen, p, 4); p += 4; pathlen = ntohl(pathlen);
     string path(p, p+pathlen);
