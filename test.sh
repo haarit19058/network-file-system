@@ -40,13 +40,13 @@ fi
 
 # Run both and log outputs
 echo "🚀 Starting server and client..."
-./server.o . 3030 > server.log 2>&1  &
+./server.o "$1" 3030 > server.log 2>&1  &
 SERVER_PID=$!
 echo "Server running with PID $SERVER_PID"
 
 sleep 1  # give server time to start
 
-./client.o mntdir 127.0.0.1 3030 > client.log 2>&1  &
+./client.o mntdir 127.0.0.1 3030 -f > client.log 2>&1  &
 CLIENT_PID=$!
 echo "Client running with PID $CLIENT_PID"
 

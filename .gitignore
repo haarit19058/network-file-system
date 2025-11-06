@@ -1,3 +1,4 @@
 demo_nfs_final
+*.log
 *.out
 *.o

@@ -42,6 +42,7 @@
 #include <sys/statvfs.h>
 #include <fcntl.h>
 #include <errno.h>
+#include<bits/stdc++.h>
 
 using namespace std;
 
@@ -314,6 +315,8 @@ static int do_open_or_create(const char *path, int flags, int mode, bool create,
 //  - Reads up to `size` bytes from `serverfd` at `offset`.
 //  - On success sets *out_read to the number of bytes actually returned.
 static int do_read(uint64_t serverfd, char *buf, size_t size, off_t offset, size_t *out_read) {
+    cout << "fd: " << serverfd << endl;
+    cout << "buf size: " << size << endl;
     uint32_t op_be = htonl(OP_READ);
     uint64_t fd_be = htobe64(serverfd);
     uint64_t off_be = htobe64((uint64_t)offset);
@@ -341,6 +344,8 @@ static int do_read(uint64_t serverfd, char *buf, size_t size, off_t offset, size
 // do_write:
 //  - Sends data to write and expects the server to return number of bytes written.
 static int do_write(uint64_t serverfd, const char *buf, size_t size, off_t offset, size_t *out_written) {
+    cout << "fd: " << serverfd << endl;
+    cout << "buf: " << string(buf, size) << endl;
     uint32_t op_be = htonl(OP_WRITE);
     uint64_t fd_be = htobe64(serverfd);
     uint64_t off_be = htobe64((uint64_t)offset);
@@ -518,6 +523,7 @@ static int do_statfs(const char *path, struct statvfs *stbuf) {
 // Callbacks return either 0 (success) or a negative errno (so FUSE can map it).
 
 static int nf_getattr(const char *path, struct stat *stbuf, struct fuse_file_info * /*fi*/) {
+    cout << "Get Attribute Called:" << endl;
     return do_getattr(path, stbuf);
 }
 
@@ -525,10 +531,12 @@ static int nf_getattr(const char *path, struct stat *stbuf, struct fuse_file_inf
 // to do_readdir which currently ignores offset and flags.
 static int nf_readdir(const char *path, void *buf, fuse_fill_dir_t filler, off_t offset,
                       struct fuse_file_info * /*fi*/, fuse_readdir_flags flags) {
+    cout << "Readdir Called:" << endl;
     return do_readdir(path, buf, filler, offset, flags);
 }
 
 static int nf_open(const char *path, struct fuse_file_info *fi) {
+    cout << "Open Called:" << endl;
     uint64_t serverfd = 0;
     int flags = fi->flags; // POSIX flags from FUSE
     int r = do_open_or_create(path, flags, 0644, false, serverfd);
@@ -546,7 +554,10 @@ static int nf_create(const char *path, mode_t mode, struct fuse_file_info *fi) {
     return 0;
 }
 
-static int nf_read(const char * /*path*/, char *buf, size_t size, off_t offset, struct fuse_file_info *fi) {
+static int nf_read(const char * path, char *buf, size_t size, off_t offset, struct fuse_file_info *fi) {
+    cout << "Read called" << endl;
+    cout << "path: " << path << endl;
+    cout << "buf size: " << size << endl;
     size_t got = 0;
     int r = do_read((uint64_t)fi->fh, buf, size, offset, &got);
     if (r < 0) return r;
@@ -605,6 +616,8 @@ int main(int argc, char **argv) {
     }
     int fargc = (int)fargs.size();
     fargs.push_back(nullptr); // fuse_main expects a null-terminated argv
+
+    cout << "Client started" << endl;
 
     // Zero-init operations structure and then assign callbacks so we
     // avoid potential designated-initializer/ordering issues on some compilers.

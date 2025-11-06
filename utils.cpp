@@ -29,8 +29,6 @@ enum Op : uint32_t
     OP_RELEASE = 13
 };
 
-
-
 // -------------------------- Utilities & helpers (kept together) --------------------------
 //
 // These helpers are shared by the handlers below. They were present in your original
@@ -67,7 +65,8 @@ static int writen(int fd, const void *buf, size_t n)
     while (left)
     {
         ssize_t w = ::write(fd, p, left);
-        if (w <= 0) return (int)w; // error
+        if (w <= 0)
+            return (int)w; // error
         left -= w;
         p += w;
     }
@@ -100,7 +99,8 @@ static string joinpath(const string &root, const string &path)
 //   payload. The client should interpret status != 0 as failure and translate the value
 //   back to its host byte order when needed.
 
-void send_errno(int client, int eno) {
+void send_errno(int client, int eno)
+{
     uint32_t status = htonl((uint32_t)eno); // send errno in big-endian
     uint32_t zlen = htonl(0);               // zero payload length
     writen(client, &status, sizeof(status));
@@ -122,8 +122,6 @@ void send_ok_with_data(int client, const void *data, uint32_t dlen)
         writen(client, data, dlen);
 };
 
- 
-
 // ---------------------- 1) OP_GETATTR ----------------------------------------------
 // Request layout (client -> server):
 //   uint32_t pathlen   (network order)
@@ -137,20 +135,28 @@ void send_ok_with_data(int client, const void *data, uint32_t dlen)
 //     expected to run on compatible POSIX platforms. If you ever need cross-platform
 //     portability, serialize individual fields explicitly.
 
-int getattr_handler(int client, const string& root,const char* p) {
+int getattr_handler(int client, const string &root, const char *p)
+{
+    // Read path length
     uint32_t pathlen;
-    memcpy(&pathlen, p, 4); p += 4; pathlen = ntohl(pathlen);
+    memcpy(&pathlen, p, 4);
+    p += 4;
+    pathlen = ntohl(pathlen);
+    
+    // Read path name
     string path(p, p + pathlen);
     string full = joinpath(root, path);
 
+    // Add attribute information using lstat
     struct stat st;
-    if (lstat(full.c_str(), &st) == -1) {
-        // lstat failed; send errno back to client so it can propagate the error.
+    if (lstat(full.c_str(), &st) == -1)
+    {
+        // lstat failed; send errno back to client
         send_errno(client, errno);
         return 1;
     }
 
-    // On success send struct stat bytes. The client should reconstruct the struct.
+    // On success send struct stat bytes
     send_ok_with_data(client, &st, sizeof(st));
     return 0;
 }
@@ -168,14 +174,21 @@ int getattr_handler(int client, const string& root,const char* p) {
 //   - We do not return type information in the current blob; if required, you can
 //     prefix each name with a type byte or send a separate array of types.
 
-int readdir_handler(int client, const string& root,const char* p) {
+int readdir_handler(int client, const string &root, const char *p)
+{
+    // Read path length
     uint32_t pathlen;
-    memcpy(&pathlen, p, 4); p += 4; pathlen = ntohl(pathlen);
+    memcpy(&pathlen, p, 4);
+    p += 4;
+    pathlen = ntohl(pathlen);
+
+    // Read path name
     string path(p, p + pathlen);
     string full = joinpath(root, path);
 
     DIR *d = opendir(full.c_str());
-    if (!d) {
+    if (!d)
+    {
         send_errno(client, errno);
         return 1;
     }
@@ -184,7 +197,8 @@ int readdir_handler(int client, const string& root,const char* p) {
     // This is a C-friendly format: the client can strtok / iterate by scanning for zeros.
     string out;
     struct dirent *e;
-    while ((e = readdir(d))) {
+    while ((e = readdir(d)))
+    {
         // skip self and parent entries
         if (strcmp(e->d_name, ".") == 0 || strcmp(e->d_name, "..") == 0)
             continue;
@@ -199,7 +213,7 @@ int readdir_handler(int client, const string& root,const char* p) {
     return 0;
 }
 
-// ---------------------- 3) OP_OPEN (and 6 OP_CREATE) -------------------------------
+// ---------------------- 3) OP_OPEN and 6) OP_CREATE -------------------------------
 // Request layout for OPEN:
 //   uint32_t pathlen
 //   char[pathlen] path
@@ -221,15 +235,19 @@ int readdir_handler(int client, const string& root,const char* p) {
 //     ever want to support remote clients, you would need a mapping (server-side) from
 //     virtual file handles to real descriptors.
 
-int open_create_handler(int client, const string& root,const char* p, int op )
+int open_create_handler(int client, const string &root, const char *p, int op)
 {
+    // Read path length
     uint32_t pathlen;
     memcpy(&pathlen, p, 4);
     p += 4;
     pathlen = ntohl(pathlen);
+
+    // Read path name
     string path(p, p + pathlen);
     p += pathlen;
 
+    // Read flags
     int flags;
     memcpy(&flags, p, 4);
     p += 4;
@@ -281,7 +299,7 @@ int open_create_handler(int client, const string& root,const char* p, int op )
 //   - Caller must ensure the sfd is valid on the server; stale or malicious sfd will
 //     cause appropriate errors.
 
-int read_handler(int client, const string& root,const char* p)
+int read_handler(int client, const string &root, const char *p)
 {
     (void)root; // read uses sfd, not path/root. keep signature compatible.
 
@@ -317,8 +335,7 @@ int read_handler(int client, const string& root,const char* p)
 
 // ---------------------- 5) OP_WRITE ------------------------------------------------
 // Request layout:
-//   uint32_t pathlen
-//   char[pathlen] path
+//   uint64_t sfd      (big-endian) [server-side fd returned earlier]
 //   uint64_t offset   (big-endian)
 //   uint32_t size
 //   char[size] data
@@ -331,40 +348,37 @@ int read_handler(int client, const string& root,const char* p)
 //     an sfd sent by the client (like read), but your original code uses path.
 //   - pwrite returns number of bytes written; we convert that to uint32 in the response.
 
-int write_handler(int client, const string& root,const char* p) {
-    uint32_t pathlen;
-    memcpy(&pathlen, p, 4); p += 4; pathlen = ntohl(pathlen);
-    string path(p, p + pathlen); p += pathlen;
+int write_handler(int client, const string &root, const char *p)
+{
+    // Read file descriptor
+    uint64_t sfd;
+    memcpy(&sfd, p, 8);
+    p += 8;
+    sfd = be64toh(sfd);
 
-    uint64_t offset;
-    memcpy(&offset, p, 8); p += 8; offset = be64toh(offset);
+    // Read offset
+    uint64_t off;
+    memcpy(&off, p, 8);
+    p += 8;
 
-    uint32_t size;
-    memcpy(&size, p, 4); p += 4; size = ntohl(size);
+    // Read write size
+    uint32_t wsize;
+    memcpy(&wsize, p, 4);
+    p += 4;
+    wsize = ntohl(wsize);
 
-    string full = joinpath(root, path);
-
-    // Open file for write-only. We intentionally do not add O_CREAT here because
-    // writes to non-existent files should typically return ENOENT; creation is handled
-    // by the CREATE operation.
-    int fd = open(full.c_str(), O_WRONLY);
-    if (fd == -1) {
+    // Remaining is data
+    const char *data = p;
+    ssize_t w = pwrite((int)sfd, data, wsize, (off_t)off);
+    if (w == -1)
+    {
         send_errno(client, errno);
         return 1;
     }
 
-    // p points to the payload data which follows the header fields.
-    ssize_t w = pwrite(fd, p, size, (off_t)offset);
-    if (w < 0) {
-        send_errno(client, errno);
-        close(fd);
-        return 1;
-    }
-
-    // Return the number of bytes written as a 32-bit value.
-    uint32_t written = htonl((uint32_t)w);
-    send_ok_with_data(client, &written, sizeof(written));
-    close(fd);
+    // Send ok
+    uint32_t wrote_be = htonl((uint32_t)w);
+    send_ok_with_data(client, &wrote_be, sizeof(wrote_be));
     return 0;
 }
 
@@ -376,13 +390,17 @@ int write_handler(int client, const string& root,const char* p) {
 // Behavior:
 //   Calls unlink() on the resolved path. On success return an empty success response.
 
-int unlink_handler(int client, const string &root,const char* p) {
+int unlink_handler(int client, const string &root, const char *p)
+{
     uint32_t pathlen;
-    memcpy(&pathlen, p, 4); p += 4; pathlen = ntohl(pathlen);
+    memcpy(&pathlen, p, 4);
+    p += 4;
+    pathlen = ntohl(pathlen);
     string path(p, p + pathlen);
     string full = joinpath(root, path);
 
-    if (unlink(full.c_str()) == -1) {
+    if (unlink(full.c_str()) == -1)
+    {
         send_errno(client, errno);
         return 1;
     }
@@ -402,16 +420,23 @@ int unlink_handler(int client, const string &root,const char* p) {
 // Notes:
 //   - mode is sent as 32-bit in network order (we convert with ntohl).
 
-int mkdir_handler(int client, const string& root, const char* p) {
+int mkdir_handler(int client, const string &root, const char *p)
+{
     uint32_t pathlen;
-    memcpy(&pathlen, p, 4); p += 4; pathlen = ntohl(pathlen);
-    string path(p, p + pathlen); p += pathlen;
+    memcpy(&pathlen, p, 4);
+    p += 4;
+    pathlen = ntohl(pathlen);
+    string path(p, p + pathlen);
+    p += pathlen;
 
     int mode;
-    memcpy(&mode, p, 4); p += 4; mode = ntohl(mode);
+    memcpy(&mode, p, 4);
+    p += 4;
+    mode = ntohl(mode);
 
     string full = joinpath(root, path);
-    if (mkdir(full.c_str(), mode) == -1) {
+    if (mkdir(full.c_str(), mode) == -1)
+    {
         send_errno(client, errno);
         return 1;
     }
@@ -428,13 +453,17 @@ int mkdir_handler(int client, const string& root, const char* p) {
 // Behavior:
 //   Calls rmdir(path). On success send empty success response.
 
-int rmdir_handler(int client, const string& root,const char* p) {
+int rmdir_handler(int client, const string &root, const char *p)
+{
     uint32_t pathlen;
-    memcpy(&pathlen, p, 4); p += 4; pathlen = ntohl(pathlen);
+    memcpy(&pathlen, p, 4);
+    p += 4;
+    pathlen = ntohl(pathlen);
     string path(p, p + pathlen);
     string full = joinpath(root, path);
 
-    if (rmdir(full.c_str()) == -1) {
+    if (rmdir(full.c_str()) == -1)
+    {
         send_errno(client, errno);
         return 1;
     }
@@ -452,16 +481,23 @@ int rmdir_handler(int client, const string& root,const char* p) {
 // Behavior:
 //   Calls truncate(path, size). On success return empty success response.
 
-int truncate_handler(int client, const string& root,const char* p) {
+int truncate_handler(int client, const string &root, const char *p)
+{
     uint32_t pathlen;
-    memcpy(&pathlen, p, 4); p += 4; pathlen = ntohl(pathlen);
-    string path(p, p + pathlen); p += pathlen;
+    memcpy(&pathlen, p, 4);
+    p += 4;
+    pathlen = ntohl(pathlen);
+    string path(p, p + pathlen);
+    p += pathlen;
 
     uint64_t size;
-    memcpy(&size, p, 8); p += 8; size = be64toh(size);
+    memcpy(&size, p, 8);
+    p += 8;
+    size = be64toh(size);
 
     string full = joinpath(root, path);
-    if (truncate(full.c_str(), (off_t)size) == -1) {
+    if (truncate(full.c_str(), (off_t)size) == -1)
+    {
         send_errno(client, errno);
         return 1;
     }
@@ -483,23 +519,38 @@ int truncate_handler(int client, const string& root,const char* p) {
 //   Calls utimensat(AT_FDCWD, path, times, AT_SYMLINK_NOFOLLOW).
 //   The times are interpreted as seconds + nanoseconds for atime and mtime.
 
-int utimens_handler(int client, const string &root, const char* p) {
+int utimens_handler(int client, const string &root, const char *p)
+{
     uint32_t pathlen;
-    memcpy(&pathlen, p, 4); p += 4; pathlen = ntohl(pathlen);
-    string path(p, p + pathlen); p += pathlen;
+    memcpy(&pathlen, p, 4);
+    p += 4;
+    pathlen = ntohl(pathlen);
+    string path(p, p + pathlen);
+    p += pathlen;
 
     uint64_t at_sec, at_nsec, mt_sec, mt_nsec;
-    memcpy(&at_sec, p, 8); p += 8; at_sec = be64toh(at_sec);
-    memcpy(&at_nsec, p, 8); p += 8; at_nsec = be64toh(at_nsec);
-    memcpy(&mt_sec, p, 8); p += 8; mt_sec = be64toh(mt_sec);
-    memcpy(&mt_nsec, p, 8); p += 8; mt_nsec = be64toh(mt_nsec);
+    memcpy(&at_sec, p, 8);
+    p += 8;
+    at_sec = be64toh(at_sec);
+    memcpy(&at_nsec, p, 8);
+    p += 8;
+    at_nsec = be64toh(at_nsec);
+    memcpy(&mt_sec, p, 8);
+    p += 8;
+    mt_sec = be64toh(mt_sec);
+    memcpy(&mt_nsec, p, 8);
+    p += 8;
+    mt_nsec = be64toh(mt_nsec);
 
     struct timespec times[2];
-    times[0].tv_sec = (time_t)at_sec;  times[0].tv_nsec = (long)at_nsec;
-    times[1].tv_sec = (time_t)mt_sec;  times[1].tv_nsec = (long)mt_nsec;
+    times[0].tv_sec = (time_t)at_sec;
+    times[0].tv_nsec = (long)at_nsec;
+    times[1].tv_sec = (time_t)mt_sec;
+    times[1].tv_nsec = (long)mt_nsec;
 
     string full = joinpath(root, path);
-    if (utimensat(AT_FDCWD, full.c_str(), times, AT_SYMLINK_NOFOLLOW) == -1) {
+    if (utimensat(AT_FDCWD, full.c_str(), times, AT_SYMLINK_NOFOLLOW) == -1)
+    {
         send_errno(client, errno);
         return 1;
     }
@@ -516,14 +567,18 @@ int utimens_handler(int client, const string &root, const char* p) {
 // Behavior:
 //   Calls statvfs on the path and returns the struct statvfs bytes on success.
 
-int statfs_handler(int client, const string &root, const char* p) {
+int statfs_handler(int client, const string &root, const char *p)
+{
     uint32_t pathlen;
-    memcpy(&pathlen, p, 4); p += 4; pathlen = ntohl(pathlen);
+    memcpy(&pathlen, p, 4);
+    p += 4;
+    pathlen = ntohl(pathlen);
     string path(p, p + pathlen);
     string full = joinpath(root, path);
 
     struct statvfs st;
-    if (statvfs(full.c_str(), &st) == -1) {
+    if (statvfs(full.c_str(), &st) == -1)
+    {
         send_errno(client, errno);
         return 1;
     }
@@ -534,23 +589,23 @@ int statfs_handler(int client, const string &root, const char* p) {
 
 // --------------------- 13) OP_RELEASE ----------------------------------------------
 // Request layout:
-//   uint32_t pathlen
-//   char[pathlen] path
+//   uint64_t sfd
 //
 // Behavior:
 //   Release is a no-op in this implementation (we don't track per-client FDs here).
 //   We simply acknowledge the release and return success. If your system tracked
 //   open handles per-client, you'd close or decrement reference counts here.
 
-int release_handler(int client, const string &root, const char *p) {
-    uint32_t pathlen;
-    memcpy(&pathlen, p, 4);
-    p += 4;
-    pathlen = ntohl(pathlen);
-    string path(p, p + pathlen);
-    (void)root; (void)path; // unused in this simple implementation
+int release_handler(int client, const string &root, const char *p)
+{
+    uint64_t sfd;
 
-    // Acknowledge the release with an empty success response.
+    memcpy(&sfd, p, 8);
+    p += 8;
+
+    sfd = be64toh(sfd);
+    close((int)sfd);
+
     send_ok_with_data(client, nullptr, 0);
     return 0;
 }

@@ -33,6 +33,5 @@ Therefore we will repopulate the files.
 
 Add comments in your parts so that anyone can understand the code 
 
-
-
-
+## New running mechanism
+Just run ./test.sh "folder_name" (Here, folder_name refers to root directory of server that you want to share) to run it on your local machine, see client.log and server.log to check function call logging
