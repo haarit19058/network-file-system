@@ -15,8 +15,17 @@
 #include <errno.h>
 #include <sys/statvfs.h>
 #include "utils.cpp"
+#include <queue>
+#include <condition_variable>
+#include <thread>
+#include <atomic>
+#include <signal.h>
 
 using namespace std;
+static std::queue<int> client_queue;
+static std::mutex queue_mtx;
+static std::condition_variable queue_cv;
+static std::atomic<bool> stop_all{false};
 
 enum Op : uint32_t {
     OP_GETATTR=1, OP_READDIR=2, OP_OPEN=3, OP_READ=4, OP_WRITE=5,
@@ -74,6 +83,40 @@ int handle_one(int client, const string &root)  {
     return 0;
 }
 
+void worker_thread_func(const string &root) {
+    while (true) {
+        int client = -1;
+
+        // Waiting for a client connection from the queue
+        {
+            std::unique_lock<std::mutex> lock(queue_mtx);
+            queue_cv.wait(lock, [] {
+                return !client_queue.empty() || stop_all.load();
+            });
+
+            if (stop_all && client_queue.empty())
+                return; // graceful exit
+
+            client = client_queue.front();
+            client_queue.pop();
+        }
+
+        // Processing the client connection
+        handle_one(client, root);
+        close(client);
+        fprintf(stderr, "[Worker %lu] client done\n",
+                (unsigned long)std::hash<std::thread::id>{}(std::this_thread::get_id()));
+    }
+}
+
+void signal_handler(int) {
+    {
+        std::lock_guard<std::mutex> lock(queue_mtx);
+        stop_all = true;
+    }
+    queue_cv.notify_all();
+}
+
 int main(int argc, char **argv) {
     if (argc < 3) {
         fprintf(stderr, "Usage: %s <root-path> <port>\n", argv[0]);
@@ -82,6 +125,8 @@ int main(int argc, char **argv) {
     string root = argv[1];
     int port = atoi(argv[2]);
 
+    signal(SIGINT, signal_handler);
+    signal(SIGTERM, signal_handler);
     int listenfd = socket(AF_INET, SOCK_STREAM, 0);
     int on = 1; setsockopt(listenfd, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on));
     struct sockaddr_in sa{};
@@ -90,15 +135,47 @@ int main(int argc, char **argv) {
     if (listen(listenfd, 10) == -1) { perror("listen"); return 1;}
     printf("Server serving root=%s on port %d\n", root.c_str(), port);
 
+    // Starting thread pool
+    const int NUM_THREADS = 8;
+    vector<std::thread> workers;
+    for (int i = 0; i < NUM_THREADS; ++i)
+        workers.emplace_back(worker_thread_func, root);
+
+
     while (true) {
-        struct sockaddr_in cli; socklen_t clilen = sizeof(cli);
-        int client = accept(listenfd, (struct sockaddr*)&cli, &clilen);
-        if (client == -1) { perror("accept"); continue; }
-        printf("Client connected: %s\n", inet_ntoa(cli.sin_addr));
-        handle_one(client, root);
-        close(client);
-        printf("Client disconnected\n");
+    struct sockaddr_in cli; socklen_t clilen = sizeof(cli);
+    int client = accept(listenfd, (struct sockaddr*)&cli, &clilen);
+    if (client == -1) {
+        if (errno == EINTR) break;
+        perror("accept");
+        continue;
     }
+
+    char addrbuf[64];
+    inet_ntop(AF_INET, &cli.sin_addr, addrbuf, sizeof(addrbuf));
+    printf("[Main] Accepted connection from %s\n", addrbuf);
+
+    {
+        std::lock_guard<std::mutex> lock(queue_mtx);
+        if (client_queue.size() > 100) {
+            fprintf(stderr, "Queue full — rejecting new client\n");
+            close(client);
+            continue;
+        }
+
+        client_queue.push(client);
+    }
+    queue_cv.notify_one();
+}
+    {
+    std::lock_guard<std::mutex> lock(queue_mtx);
+    stop_all = true;
+    }
+    queue_cv.notify_all();
+
+    for (auto &t : workers)
+        if (t.joinable()) t.join();
+
     close(listenfd);
     return 0;
 }
