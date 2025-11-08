@@ -53,5 +53,3 @@ echo "Client running with PID $CLIENT_PID"
 
 # Wait for both to finish or Ctrl+C
 wait "$SERVER_PID" "$CLIENT_PID"
-
-
