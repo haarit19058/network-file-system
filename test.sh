@@ -24,6 +24,7 @@ cleanup() {
 trap cleanup INT TERM EXIT   # Trap Ctrl+C (SIGINT), kill, or script exit
 
 # Remove old logs
+rm -f *.log
 rm -f server.log client.log
 
 # Build both
@@ -46,10 +47,11 @@ echo "Server running with PID $SERVER_PID"
 
 sleep 1  # give server time to start
 
-./client.o mntdir 127.0.0.1 3030 -f > client.log 2>&1  &
+./client.o mntdir 127.0.0.1 3030 -f -o attr_timeout=10 -o entry_timeout=10 -o negative_timeout=10 -o auto_cache  -o kernel_cache > client.log 2>&1  &
 CLIENT_PID=$!
 echo "Client running with PID $CLIENT_PID"
 
 # Wait for both to finish or Ctrl+C
 wait "$SERVER_PID" "$CLIENT_PID"
+
 

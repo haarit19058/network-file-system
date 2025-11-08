@@ -45,6 +45,7 @@
 #include<bits/stdc++.h>
 
 using namespace std;
+#define CHUNK_SIZE 131072
 
 // ----------------------------- Operation enum -----------------------------
 // Numeric operation codes used in the protocol. Stored on-wire as 32-bit BE.
@@ -314,64 +315,103 @@ static int do_open_or_create(const char *path, int flags, int mode, bool create,
 // do_read:
 //  - Reads up to `size` bytes from `serverfd` at `offset`.
 //  - On success sets *out_read to the number of bytes actually returned.
+// do_read:
+//  - Reads up to `size` bytes from `serverfd` at `offset`.
+//  - Streams the data in CHUNK_SIZE blocks to avoid large allocations.
 static int do_read(uint64_t serverfd, char *buf, size_t size, off_t offset, size_t *out_read) {
-    cout << "fd: " << serverfd << endl;
-    cout << "buf size: " << size << endl;
-    uint32_t op_be = htonl(OP_READ);
-    uint64_t fd_be = htobe64(serverfd);
-    uint64_t off_be = htobe64((uint64_t)offset);
-    uint32_t size_be = htonl(static_cast<uint32_t>(size));
+    size_t total_read = 0;
+    char chunkbuf[CHUNK_SIZE];
 
-    vector<char> payload;
-    payload.insert(payload.end(), reinterpret_cast<char*>(&op_be), reinterpret_cast<char*>(&op_be) + 4);
-    payload.insert(payload.end(), reinterpret_cast<char*>(&fd_be), reinterpret_cast<char*>(&fd_be) + 8);
-    payload.insert(payload.end(), reinterpret_cast<char*>(&off_be), reinterpret_cast<char*>(&off_be) + 8);
-    payload.insert(payload.end(), reinterpret_cast<char*>(&size_be), reinterpret_cast<char*>(&size_be) + 4);
+    while (total_read < size) {
+        size_t this_chunk = std::min((size_t)CHUNK_SIZE, size - total_read);
 
-    vector<char> resp;
-    if (send_frame_and_recv(payload.data(), (uint32_t)payload.size(), resp) != 0) return -EIO;
-    if (resp.size() < 4) return -EIO;
-    uint32_t status;
-    memcpy(&status, resp.data(), 4);
-    if (status != 0) return - (int) status;
+        uint32_t op_be = htonl(OP_READ);
+        uint64_t fd_be = htobe64(serverfd);
+        uint64_t off_be = htobe64((uint64_t)(offset + total_read));
+        uint32_t size_be = htonl(static_cast<uint32_t>(this_chunk));
 
-    size_t dlen = resp.size() - 4; // bytes of read data
-    if (dlen && buf) memcpy(buf, resp.data() + 4, dlen);
-    *out_read = dlen;
+        std::vector<char> payload;
+        payload.insert(payload.end(), reinterpret_cast<char*>(&op_be), reinterpret_cast<char*>(&op_be) + 4);
+        payload.insert(payload.end(), reinterpret_cast<char*>(&fd_be), reinterpret_cast<char*>(&fd_be) + 8);
+        payload.insert(payload.end(), reinterpret_cast<char*>(&off_be), reinterpret_cast<char*>(&off_be) + 8);
+        payload.insert(payload.end(), reinterpret_cast<char*>(&size_be), reinterpret_cast<char*>(&size_be) + 4);
+
+        std::vector<char> resp;
+        if (send_frame_and_recv(payload.data(), (uint32_t)payload.size(), resp) != 0)
+            return -EIO;
+
+        if (resp.size() < 4)
+            return -EIO;
+
+        uint32_t status;
+        memcpy(&status, resp.data(), 4);
+        if (status != 0)
+            return -(int)status;
+
+        size_t dlen = resp.size() - 4;
+        if (dlen == 0)
+            break; // EOF
+
+        if (buf)
+            memcpy(buf + total_read, resp.data() + 4, dlen);
+
+        total_read += dlen;
+        if (dlen < this_chunk)
+            break; // short read, done
+    }
+
+    *out_read = total_read;
     return 0;
 }
+
 
 // do_write:
-//  - Sends data to write and expects the server to return number of bytes written.
+//  - Sends data to write in CHUNK_SIZE chunks.
+//  - Expects server to respond with bytes written per chunk.
 static int do_write(uint64_t serverfd, const char *buf, size_t size, off_t offset, size_t *out_written) {
-    cout << "fd: " << serverfd << endl;
-    cout << "buf: " << string(buf, size) << endl;
-    uint32_t op_be = htonl(OP_WRITE);
-    uint64_t fd_be = htobe64(serverfd);
-    uint64_t off_be = htobe64((uint64_t)offset);
-    uint32_t size_be = htonl(static_cast<uint32_t>(size));
+    size_t total_written = 0;
 
-    // payload: op | fd | offset | size | data...
-    vector<char> payload;
-    payload.insert(payload.end(), reinterpret_cast<char*>(&op_be), reinterpret_cast<char*>(&op_be) + 4);
-    payload.insert(payload.end(), reinterpret_cast<char*>(&fd_be), reinterpret_cast<char*>(&fd_be) + 8);
-    payload.insert(payload.end(), reinterpret_cast<char*>(&off_be), reinterpret_cast<char*>(&off_be) + 8);
-    payload.insert(payload.end(), reinterpret_cast<char*>(&size_be), reinterpret_cast<char*>(&size_be) + 4);
-    payload.insert(payload.end(), buf, buf + size);
+    while (total_written < size) {
+        size_t this_chunk = std::min((size_t)CHUNK_SIZE, size - total_written);
 
-    vector<char> resp;
-    if (send_frame_and_recv(payload.data(), (uint32_t)payload.size(), resp) != 0) return -EIO;
-    if (resp.size() < 4 + 4) return -EIO;
-    uint32_t status;
-    memcpy(&status, resp.data(), 4);
-    if (status != 0) return - (int) status;
+        uint32_t op_be = htonl(OP_WRITE);
+        uint64_t fd_be = htobe64(serverfd);
+        uint64_t off_be = htobe64((uint64_t)(offset + total_written));
+        uint32_t size_be = htonl(static_cast<uint32_t>(this_chunk));
 
-    uint32_t wrote_be;
-    memcpy(&wrote_be, resp.data() + 4, 4);
-    uint32_t wrote = ntohl(wrote_be);
-    *out_written = wrote;
+        // payload: op | fd | offset | size | data...
+        std::vector<char> payload;
+        payload.insert(payload.end(), reinterpret_cast<char*>(&op_be), reinterpret_cast<char*>(&op_be) + 4);
+        payload.insert(payload.end(), reinterpret_cast<char*>(&fd_be), reinterpret_cast<char*>(&fd_be) + 8);
+        payload.insert(payload.end(), reinterpret_cast<char*>(&off_be), reinterpret_cast<char*>(&off_be) + 8);
+        payload.insert(payload.end(), reinterpret_cast<char*>(&size_be), reinterpret_cast<char*>(&size_be) + 4);
+        payload.insert(payload.end(), buf + total_written, buf + total_written + this_chunk);
+
+        std::vector<char> resp;
+        if (send_frame_and_recv(payload.data(), (uint32_t)payload.size(), resp) != 0)
+            return -EIO;
+
+        if (resp.size() < 8)
+            return -EIO;
+
+        uint32_t status;
+        memcpy(&status, resp.data(), 4);
+        if (status != 0)
+            return -(int)status;
+
+        uint32_t wrote_be;
+        memcpy(&wrote_be, resp.data() + 4, 4);
+        uint32_t wrote = ntohl(wrote_be);
+
+        total_written += wrote;
+        if (wrote < this_chunk)
+            break; // probably full disk or partial write
+    }
+
+    *out_written = total_written;
     return 0;
 }
+
 
 // do_release: close server-side handle
 static int do_release(uint64_t serverfd) {

@@ -12,6 +12,10 @@
 #include <sys/statvfs.h>
 using namespace std;
 
+
+
+#define CHUNK_SIZE 131072 
+
 enum Op : uint32_t
 {
     OP_GETATTR = 1,
@@ -301,7 +305,7 @@ int open_create_handler(int client, const string &root, const char *p, int op)
 
 int read_handler(int client, const string &root, const char *p)
 {
-    (void)root; // read uses sfd, not path/root. keep signature compatible.
+    (void)root; // unused
 
     uint64_t sfd;
     memcpy(&sfd, p, 8);
@@ -318,21 +322,29 @@ int read_handler(int client, const string &root, const char *p)
     p += 4;
     size = ntohl(size);
 
-    // allocate a buffer to hold the data requested
-    vector<char> datab(size);
+    char buf[CHUNK_SIZE];
+    size_t total_read = 0;
 
-    ssize_t r = pread((int)sfd, datab.data(), size, (off_t)off);
-    if (r == -1)
-    {
-        send_errno(client, errno);
-        return 1;
+    while (total_read < size) {
+        size_t this_chunk = std::min((size_t)CHUNK_SIZE, (size_t)(size - total_read));
+        ssize_t r = pread((int)sfd, buf, this_chunk, (off_t)(off + total_read));
+        if (r < 0) {
+            send_errno(client, errno);
+            return 1;
+        }
+        if (r == 0)
+            break; // EOF
+
+        // send_ok_with_data adds 4-byte status (0) automatically
+        send_ok_with_data(client, buf, (uint32_t)r);
+
+        total_read += r;
+        if ((size_t)r < this_chunk)
+            break; // hit EOF early
     }
 
-    // send back exactly 'r' bytes (r may be less than requested if EOF)
-    send_ok_with_data(client, datab.data(), (uint32_t)r);
     return 0;
 }
-
 // ---------------------- 5) OP_WRITE ------------------------------------------------
 // Request layout:
 //   uint64_t sfd      (big-endian) [server-side fd returned earlier]
@@ -347,37 +359,41 @@ int read_handler(int client, const string &root, const char *p)
 //   - This handler opens by path (not by sfd). An alternative design is to use
 //     an sfd sent by the client (like read), but your original code uses path.
 //   - pwrite returns number of bytes written; we convert that to uint32 in the response.
-
 int write_handler(int client, const string &root, const char *p)
 {
-    // Read file descriptor
+    (void)root;
+
     uint64_t sfd;
     memcpy(&sfd, p, 8);
     p += 8;
     sfd = be64toh(sfd);
 
-    // Read offset
     uint64_t off;
     memcpy(&off, p, 8);
     p += 8;
+    off = be64toh(off);
 
-    // Read write size
     uint32_t wsize;
     memcpy(&wsize, p, 4);
     p += 4;
     wsize = ntohl(wsize);
 
-    // Remaining is data
     const char *data = p;
-    ssize_t w = pwrite((int)sfd, data, wsize, (off_t)off);
-    if (w == -1)
-    {
-        send_errno(client, errno);
-        return 1;
+    size_t total_written = 0;
+
+    while (total_written < wsize) {
+        size_t this_chunk = std::min((size_t)CHUNK_SIZE, (size_t)(wsize - total_written));
+        ssize_t w = pwrite((int)sfd, data + total_written, this_chunk, (off_t)(off + total_written));
+        if (w == -1) {
+            send_errno(client, errno);
+            return 1;
+        }
+        total_written += w;
+        if ((size_t)w < this_chunk)
+            break;
     }
 
-    // Send ok
-    uint32_t wrote_be = htonl((uint32_t)w);
+    uint32_t wrote_be = htonl((uint32_t)total_written);
     send_ok_with_data(client, &wrote_be, sizeof(wrote_be));
     return 0;
 }
