@@ -1,4 +1,3 @@
-
 #!/bin/bash
 # run_fs.sh — build and run server/client with logs (with Ctrl+C handling)
 
