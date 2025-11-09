@@ -253,9 +253,9 @@ int read_handler(int client, const string &root, const char *p)
     }
 
     // Client chunks requests, but good to double-check
-    if (size > CHUNK_SIZE) {
-        size = CHUNK_SIZE; 
-    }
+    // if (size > CHUNK_SIZE) {
+    //     size = CHUNK_SIZE; 
+    // }
 
     vector<char> buf(size);
     ssize_t r = pread((int)sfd, buf.data(), size, (off_t)off);
