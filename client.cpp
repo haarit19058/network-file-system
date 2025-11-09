@@ -55,20 +55,34 @@ static string opcode_to_string(uint32_t op)
 {
     switch (op)
     {
-    case OP_GETATTR: return "GETATTR";
-    case OP_READDIR: return "READDIR";
-    case OP_OPEN: return "OPEN";
-    case OP_READ: return "READ";
-    case OP_WRITE: return "WRITE";
-    case OP_CREATE: return "CREATE";
-    case OP_UNLINK: return "UNLINK";
-    case OP_MKDIR: return "MKDIR";
-    case OP_RMDIR: return "RMDIR";
-    case OP_TRUNCATE: return "TRUNCATE";
-    case OP_UTIMENS: return "UTIMENS";
-    case OP_STATFS: return "STATFS";
-    case OP_RELEASE: return "RELEASE";
-    default: return "UNKNOWN";
+    case OP_GETATTR:
+        return "GETATTR";
+    case OP_READDIR:
+        return "READDIR";
+    case OP_OPEN:
+        return "OPEN";
+    case OP_READ:
+        return "READ";
+    case OP_WRITE:
+        return "WRITE";
+    case OP_CREATE:
+        return "CREATE";
+    case OP_UNLINK:
+        return "UNLINK";
+    case OP_MKDIR:
+        return "MKDIR";
+    case OP_RMDIR:
+        return "RMDIR";
+    case OP_TRUNCATE:
+        return "TRUNCATE";
+    case OP_UTIMENS:
+        return "UTIMENS";
+    case OP_STATFS:
+        return "STATFS";
+    case OP_RELEASE:
+        return "RELEASE";
+    default:
+        return "UNKNOWN";
     }
 }
 
@@ -118,14 +132,14 @@ static int sockfd = -1;
 static mutex sock_mtx;
 
 // ---------------------------- Caching parameters ---------------------------
-static const size_t CACHE_BLOCK_SIZE = 4096;                       // 4KB blocks
-static const size_t CACHE_CAPACITY_BYTES = 16 * 1024 * 1024;       // 16 MB total cache
+static const size_t CACHE_BLOCK_SIZE = 4096;                 // 4KB blocks
+static const size_t CACHE_CAPACITY_BYTES = 16 * 1024 * 1024; // 16 MB total cache
 
 // ------------------------------- Cache types ------------------------------
 struct CacheValue
 {
-    string data;   // actual bytes
-    size_t size;   // data.size()
+    string data; // actual bytes
+    size_t size; // data.size()
 };
 using LRUList = list<pair<string, CacheValue>>;
 
@@ -152,6 +166,8 @@ static void cache_evict_if_needed()
 
 static void cache_put_block(const string &key, const char *data, size_t len)
 {
+    if (len > CACHE_CAPACITY_BYTES)
+        return;
     lock_guard<mutex> lk(cache_mtx);
 
     auto it = cache_map.find(key);
@@ -196,7 +212,7 @@ static void cache_invalidate_path(const string &path)
 {
     lock_guard<mutex> lk(cache_mtx);
     string prefix = path + ":";
-    for (auto it = lru_list.begin(); it != lru_list.end(); )
+    for (auto it = lru_list.begin(); it != lru_list.end();)
     {
         if (it->first.rfind(prefix, 0) == 0)
         {
@@ -338,7 +354,7 @@ static int send_frame_and_recv(const void *payload, uint32_t payload_len, vector
 
     auto end = high_resolution_clock::now();
     out_latency_us = duration_cast<microseconds>(end - start).count();
-    out_bytes_sent = sizeof(len_be) + payload_len; // 4 + payload
+    out_bytes_sent = sizeof(len_be) + payload_len;               // 4 + payload
     out_bytes_recv = sizeof(status_be) + sizeof(dlen_be) + dlen; // 8 + dlen
 
     return 0;
@@ -357,7 +373,8 @@ static int do_getattr(const char *path, struct stat *stbuf)
     payload.insert(payload.end(), p.begin(), p.end());
 
     vector<char> resp;
-    long latency_us = 0; size_t bytes_sent = 0, bytes_recv = 0;
+    long latency_us = 0;
+    size_t bytes_sent = 0, bytes_recv = 0;
     if (send_frame_and_recv(payload.data(), (uint32_t)payload.size(), resp, latency_us, bytes_sent, bytes_recv) != 0)
         return -EIO;
 
@@ -389,7 +406,8 @@ static int do_readdir(const char *path, void *buf, fuse_fill_dir_t filler)
     payload.insert(payload.end(), p.begin(), p.end());
 
     vector<char> resp;
-    long latency_us = 0; size_t bytes_sent = 0, bytes_recv = 0;
+    long latency_us = 0;
+    size_t bytes_sent = 0, bytes_recv = 0;
     if (send_frame_and_recv(payload.data(), (uint32_t)payload.size(), resp, latency_us, bytes_sent, bytes_recv) != 0)
         return -EIO;
 
@@ -407,7 +425,11 @@ static int do_readdir(const char *path, void *buf, fuse_fill_dir_t filler)
     size_t i = 0;
     while (i < len)
     {
-        if (ptr[i] == '\0') { ++i; continue; }
+        if (ptr[i] == '\0')
+        {
+            ++i;
+            continue;
+        }
         const char *name = ptr + i;
         size_t nlen = strlen(name);
         filler(buf, name, NULL, 0, static_cast<fuse_fill_dir_flags>(0));
@@ -436,7 +458,8 @@ static int do_open_or_create(const char *path, int flags, int mode, bool create,
     }
 
     vector<char> resp;
-    long latency_us = 0; size_t bytes_sent = 0, bytes_recv = 0;
+    long latency_us = 0;
+    size_t bytes_sent = 0, bytes_recv = 0;
     if (send_frame_and_recv(payload.data(), (uint32_t)payload.size(), resp, latency_us, bytes_sent, bytes_recv) != 0)
         return -EIO;
 
@@ -483,7 +506,8 @@ static int do_read(uint64_t serverfd, char *buf, size_t size, off_t offset, size
         payload.insert(payload.end(), reinterpret_cast<char *>(&size_be), reinterpret_cast<char *>(&size_be) + 4);
 
         vector<char> resp;
-        long latency_us = 0; size_t bytes_sent = 0, bytes_recv = 0;
+        long latency_us = 0;
+        size_t bytes_sent = 0, bytes_recv = 0;
         if (send_frame_and_recv(payload.data(), (uint32_t)payload.size(), resp, latency_us, bytes_sent, bytes_recv) != 0)
             return -EIO;
 
@@ -534,7 +558,8 @@ static int do_write(uint64_t serverfd, const char *buf, size_t size, off_t offse
         payload.insert(payload.end(), buf + total_written, buf + total_written + this_chunk);
 
         vector<char> resp;
-        long latency_us = 0; size_t bytes_sent = 0, bytes_recv = 0;
+        long latency_us = 0;
+        size_t bytes_sent = 0, bytes_recv = 0;
         if (send_frame_and_recv(payload.data(), (uint32_t)payload.size(), resp, latency_us, bytes_sent, bytes_recv) != 0)
             return -EIO;
 
@@ -570,7 +595,8 @@ static int do_release(uint64_t serverfd)
     payload.insert(payload.end(), reinterpret_cast<char *>(&fd_be), reinterpret_cast<char *>(&fd_be) + 8);
 
     vector<char> resp;
-    long latency_us = 0; size_t bytes_sent = 0, bytes_recv = 0;
+    long latency_us = 0;
+    size_t bytes_sent = 0, bytes_recv = 0;
     if (send_frame_and_recv(payload.data(), (uint32_t)payload.size(), resp, latency_us, bytes_sent, bytes_recv) != 0)
         return -EIO;
 
@@ -597,7 +623,8 @@ static int do_unlink(const char *path)
     payload.insert(payload.end(), p.begin(), p.end());
 
     vector<char> resp;
-    long latency_us = 0; size_t bytes_sent = 0, bytes_recv = 0;
+    long latency_us = 0;
+    size_t bytes_sent = 0, bytes_recv = 0;
     if (send_frame_and_recv(payload.data(), (uint32_t)payload.size(), resp, latency_us, bytes_sent, bytes_recv) != 0)
         return -EIO;
 
@@ -628,7 +655,8 @@ static int do_mkdir(const char *path, mode_t mode)
     payload.insert(payload.end(), reinterpret_cast<char *>(&mode_be), reinterpret_cast<char *>(&mode_be) + 4);
 
     vector<char> resp;
-    long latency_us = 0; size_t bytes_sent = 0, bytes_recv = 0;
+    long latency_us = 0;
+    size_t bytes_sent = 0, bytes_recv = 0;
     if (send_frame_and_recv(payload.data(), (uint32_t)payload.size(), resp, latency_us, bytes_sent, bytes_recv) != 0)
         return -EIO;
 
@@ -655,7 +683,8 @@ static int do_rmdir(const char *path)
     payload.insert(payload.end(), p.begin(), p.end());
 
     vector<char> resp;
-    long latency_us = 0; size_t bytes_sent = 0, bytes_recv = 0;
+    long latency_us = 0;
+    size_t bytes_sent = 0, bytes_recv = 0;
     if (send_frame_and_recv(payload.data(), (uint32_t)payload.size(), resp, latency_us, bytes_sent, bytes_recv) != 0)
         return -EIO;
 
@@ -684,7 +713,8 @@ static int do_truncate(const char *path, off_t size)
     payload.insert(payload.end(), reinterpret_cast<char *>(&size_be), reinterpret_cast<char *>(&size_be) + 8);
 
     vector<char> resp;
-    long latency_us = 0; size_t bytes_sent = 0, bytes_recv = 0;
+    long latency_us = 0;
+    size_t bytes_sent = 0, bytes_recv = 0;
     if (send_frame_and_recv(payload.data(), (uint32_t)payload.size(), resp, latency_us, bytes_sent, bytes_recv) != 0)
         return -EIO;
 
@@ -721,7 +751,8 @@ static int do_utimens(const char *path, const struct timespec tv[2])
     payload.insert(payload.end(), reinterpret_cast<char *>(&mt_nsec), reinterpret_cast<char *>(&mt_nsec) + 8);
 
     vector<char> resp;
-    long latency_us = 0; size_t bytes_sent = 0, bytes_recv = 0;
+    long latency_us = 0;
+    size_t bytes_sent = 0, bytes_recv = 0;
     if (send_frame_and_recv(payload.data(), (uint32_t)payload.size(), resp, latency_us, bytes_sent, bytes_recv) != 0)
         return -EIO;
 
@@ -748,7 +779,8 @@ static int do_statfs(const char *path, struct statvfs *stbuf)
     payload.insert(payload.end(), p.begin(), p.end());
 
     vector<char> resp;
-    long latency_us = 0; size_t bytes_sent = 0, bytes_recv = 0;
+    long latency_us = 0;
+    size_t bytes_sent = 0, bytes_recv = 0;
     if (send_frame_and_recv(payload.data(), (uint32_t)payload.size(), resp, latency_us, bytes_sent, bytes_recv) != 0)
         return -EIO;
 
@@ -767,17 +799,20 @@ static int do_statfs(const char *path, struct statvfs *stbuf)
 // ------------------------------ FUSE callbacks ------------------------------
 static int nf_getattr(const char *path, struct stat *stbuf, struct fuse_file_info *)
 {
+    cout << "Get Attr called" << endl;
     return do_getattr(path, stbuf);
 }
 
 static int nf_readdir(const char *path, void *buf, fuse_fill_dir_t filler, off_t, struct fuse_file_info *, fuse_readdir_flags)
 {
+    cout << "Readdir called" << endl;
     return do_readdir(path, buf, filler);
 }
 
 static int nf_open(const char *path, struct fuse_file_info *fi)
 {
     uint64_t serverfd = 0;
+    fi->direct_io = 1;
     int flags = fi->flags;
     int r = do_open_or_create(path, flags, 0644, false, serverfd);
     if (r < 0)
@@ -789,6 +824,7 @@ static int nf_open(const char *path, struct fuse_file_info *fi)
 static int nf_create(const char *path, mode_t mode, struct fuse_file_info *fi)
 {
     uint64_t serverfd = 0;
+    fi->direct_io = 1;
     int r = do_open_or_create(path, fi->flags, mode, true, serverfd);
     if (r < 0)
         return r;
@@ -805,58 +841,75 @@ static int nf_read(const char *path, char *buf, size_t size, off_t offset, struc
     string spath(path);
     uint64_t serverfd = (uint64_t)fi->fh;
 
+    cout << "Read offset: " << offset << ", size: " << size << endl;
+
     size_t bytes_filled = 0;
-    uint64_t first_block = (uint64_t)offset / CACHE_BLOCK_SIZE;
-    uint64_t last_block = (uint64_t)(offset + size - 1) / CACHE_BLOCK_SIZE;
+    uint64_t first_block = offset / CACHE_BLOCK_SIZE;
+    uint64_t last_block  = (offset + size - 1) / CACHE_BLOCK_SIZE;
+
+    cout << "Blocks range: " << first_block << " → " << last_block << endl;
 
     for (uint64_t b = first_block; b <= last_block; ++b)
     {
-        off_t block_offset = (off_t)(b * CACHE_BLOCK_SIZE);
-        size_t within_block_offset = 0;
-        if (b == first_block)
-            within_block_offset = (size_t)((uint64_t)offset % CACHE_BLOCK_SIZE);
-        size_t want = CACHE_BLOCK_SIZE - within_block_offset;
-        size_t remaining_needed = size - bytes_filled;
-        if (want > remaining_needed)
-            want = remaining_needed;
+        off_t block_offset = b * CACHE_BLOCK_SIZE;
+        size_t within_block_offset = (b == first_block) ? (offset % CACHE_BLOCK_SIZE) : 0;
+        size_t want = min(CACHE_BLOCK_SIZE - within_block_offset, size - bytes_filled);
 
         string key = make_block_key(spath, b);
 
-        char tmpblock[CACHE_BLOCK_SIZE];
+        char tmpblock[CACHE_BLOCK_SIZE] = {0};
         size_t got_block_len = 0;
+
+        // ---- Try cache first ----
         bool in_cache = cache_get_block(key, tmpblock, got_block_len);
 
         if (in_cache)
         {
-            // cache hit: log and copy
+            cout << "[Cache hit] key=" << key << " len=" << got_block_len << endl;
             metrics.log(opcode_to_string(OP_READ), 0, 0, got_block_len, "hit");
         }
         else
         {
-            // cache miss: fetch entire block from server
+            cout << "[Cache miss] key=" << key << " → fetching from server..." << endl;
+
             vector<char> rbuf(CACHE_BLOCK_SIZE);
             size_t server_got = 0;
+
             int rr = do_read(serverfd, rbuf.data(), CACHE_BLOCK_SIZE, block_offset, &server_got);
-            if (rr < 0) return rr;
+            if (rr < 0)
+            {
+                cerr << "Server read failed with code " << rr << endl;
+                return rr; // NOTE: ensure do_read returns -errno, not random negative
+            }
+
+            // Store in cache
             cache_put_block(key, rbuf.data(), server_got);
+
             memcpy(tmpblock, rbuf.data(), server_got);
             got_block_len = server_got;
         }
 
-        size_t avail_in_block = got_block_len > within_block_offset ? (got_block_len - within_block_offset) : 0;
+        // ---- Copy requested range into buf ----
+        size_t avail_in_block = (got_block_len > within_block_offset)
+                                    ? (got_block_len - within_block_offset)
+                                    : 0;
+
         size_t to_copy = min(avail_in_block, want);
         if (to_copy > 0)
         {
             memcpy(buf + bytes_filled, tmpblock + within_block_offset, to_copy);
             bytes_filled += to_copy;
         }
+
+        // If we reached EOF (server block shorter than expected), stop.
         if (got_block_len < within_block_offset + want)
-        {
             break;
-        }
     }
 
-    return (int)bytes_filled;
+    cout << "Total bytes read: " << bytes_filled << endl;
+    cout.flush();
+
+    return static_cast<int>(bytes_filled);
 }
 
 static int nf_write(const char *path, const char *buf, size_t size, off_t offset, struct fuse_file_info *fi)
@@ -871,7 +924,10 @@ static int nf_write(const char *path, const char *buf, size_t size, off_t offset
     {
         lock_guard<mutex> lk(fdpath_mtx);
         auto it = fd_to_path.find(serverfd);
-        if (it != fd_to_path.end()) spath = it->second; else spath = string(path);
+        if (it != fd_to_path.end())
+            spath = it->second;
+        else
+            spath = string(path);
     }
     if (!spath.empty())
     {
@@ -895,9 +951,14 @@ static int nf_release(const char *path, struct fuse_file_info *fi)
     {
         lock_guard<mutex> lk(fdpath_mtx);
         auto it = fd_to_path.find(serverfd);
-        if (it != fd_to_path.end()) { spath = it->second; fd_to_path.erase(it); }
+        if (it != fd_to_path.end())
+        {
+            spath = it->second;
+            fd_to_path.erase(it);
+        }
     }
-    if (!spath.empty()) cache_invalidate_path(spath);
+    if (!spath.empty())
+        cache_invalidate_path(spath);
 
     return do_release(serverfd);
 }
@@ -930,7 +991,8 @@ int main(int argc, char **argv)
     vector<char *> fargs;
     fargs.push_back(argv[0]);
     fargs.push_back(const_cast<char *>(mountpoint));
-    for (int i = 4; i < argc; ++i) fargs.push_back(argv[i]);
+    for (int i = 4; i < argc; ++i)
+        fargs.push_back(argv[i]);
     int fargc = (int)fargs.size();
     fargs.push_back(nullptr);
 
@@ -951,6 +1013,10 @@ int main(int argc, char **argv)
 
     int ret = fuse_main(fargc, fargs.data(), &nf_ops, nullptr);
 
-    if (sockfd >= 0) { close(sockfd); sockfd = -1; }
+    if (sockfd >= 0)
+    {
+        close(sockfd);
+        sockfd = -1;
+    }
     return ret;
 }
