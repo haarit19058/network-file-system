@@ -77,9 +77,6 @@ static string opcode_to_string(uint32_t op)
     }
 }
 
-
-
-
 // ----------------------------- Helper that prints errno and exits
 static void die(const char *m)
 {
@@ -118,53 +115,6 @@ static int connect_to_server(const char *host, const char *port)
     freeaddrinfo(res);
     return s;
 }
-
-// Reads exactly n bytes from fd into buf
-static int readn(int fd, void *buf, size_t n)
-{
-    size_t left = n;
-    char *p = static_cast<char *>(buf);
-
-    while (left)
-    {
-        ssize_t r = ::read(fd, p, left);
-        if (r < 0)
-        {
-            if (errno == EINTR)
-                continue;
-            return -1; // Error
-        }
-        if (r == 0)
-            return 0; // EOF
-        left -= r;
-        p += r;
-    }
-    return (int)n;
-}
-
-// Writes exactly n bytes from buf to fd
-static int writen(int fd, const void *buf, size_t n)
-{
-    size_t left = n;
-    const char *p = static_cast<const char *>(buf);
-
-    while (left)
-    {
-        ssize_t w = ::write(fd, p, left);
-        if (w < 0)
-        {
-            if (errno == EINTR)
-                continue;
-            return -1; // Error
-        }
-        if (w == 0)
-            return 0; // Should not happen for sockets
-        left -= w;
-        p += w;
-    }
-    return (int)n;
-}
-
 
 
 // ------------------------------ Metrics logger ----------------------------
@@ -529,6 +479,53 @@ public:
 };
 
 
+
+// Reads exactly n bytes from fd into buf
+static int readn(int fd, void *buf, size_t n)
+{
+    size_t left = n;
+    char *p = static_cast<char *>(buf);
+
+    while (left)
+    {
+        ssize_t r = ::read(fd, p, left);
+        if (r < 0)
+        {
+            if (errno == EINTR)
+                continue;
+            return -1; // Error
+        }
+        if (r == 0)
+            return 0; // EOF
+        left -= r;
+        p += r;
+    }
+    return (int)n;
+}
+
+// Writes exactly n bytes from buf to fd
+static int writen(int fd, const void *buf, size_t n)
+{
+    size_t left = n;
+    const char *p = static_cast<const char *>(buf);
+
+    while (left)
+    {
+        ssize_t w = ::write(fd, p, left);
+        if (w < 0)
+        {
+            if (errno == EINTR)
+                continue;
+            return -1; // Error
+        }
+        if (w == 0)
+            return 0; // Should not happen for sockets
+        left -= w;
+        p += w;
+    }
+    return (int)n;
+}
+
 // Core network protocol function.
 // Sends a 4-byte BE length + payload.
 // Receives a 4-byte BE status + 4-byte BE dlen + data.
@@ -608,7 +605,6 @@ static int send_frame_and_recv(uint32_t opcode, const void *payload, uint32_t pa
     // Return the status code (0 for success, errno otherwise)
     return (int)status;
 }
-
 
 // ------------------------ High level operation helpers ------------------------
 // These helpers format the request payload, call send_frame_and_recv, 
@@ -1108,7 +1104,7 @@ static int nf_create(const char *path, mode_t mode, struct fuse_file_info *fi)
     return 0;
 }
 
-// Serve reads from block cache when possible. For missing blocks, fetch from server.
+// MODIFIED: Implemented read-ahead logic on cache miss
 static int nf_read(const char *path, char *buf, size_t size, off_t offset, struct fuse_file_info *fi)
 {
     cout << "FUSE: read(path=" << path << ", size=" << size << ", offset=" << offset << ")" << endl;
@@ -1121,12 +1117,11 @@ static int nf_read(const char *path, char *buf, size_t size, off_t offset, struc
     uint64_t first_block = offset / CACHE_BLOCK_SIZE;
     uint64_t last_block  = (offset + size - 1) / CACHE_BLOCK_SIZE;
 
+    // This loop iterates over the blocks the *user* is requesting
     for (uint64_t b = first_block; b <= last_block; ++b)
     {
         off_t block_start_offset = b * CACHE_BLOCK_SIZE;
-        // Calculate where our *requested* data starts within this block
         size_t within_block_offset = (b == first_block) ? (offset % CACHE_BLOCK_SIZE) : 0;
-        // Calculate how many bytes we *want* from this block
         size_t want_from_this_block = min(CACHE_BLOCK_SIZE - within_block_offset, size - bytes_filled);
 
         string key = make_block_key(spath, b);
@@ -1141,32 +1136,58 @@ static int nf_read(const char *path, char *buf, size_t size, off_t offset, struc
         {
             // Cache Hit
             cout << "  [Cache hit] key=" << key << " len=" << got_block_len << endl;
-            // Log a 0-latency "hit" event
             metrics.log(opcode_to_string(OP_READ), 0, 0, 0, "hit");
         }
         else
         {
             // Cache Miss
-            cout << "  [Cache miss] key=" << key << " -> fetching block from server..." << endl;
+            cout << "  [Cache miss] key=" << key << " -> initiating read-ahead..." << endl;
 
-            // We must read the *entire* block from the server to cache it
-            vector<char> rbuf(CACHE_BLOCK_SIZE);
+            // --- READ-AHEAD LOGIC (REVISED) ---
+            // On a miss, always try to read a full CHUNK_SIZE (128KB)
+            // starting from the beginning of the block that was missed.
+            // This pre-fetches subsequent blocks for future reads.
+            off_t readahead_offset = block_start_offset;
+            size_t readahead_size = CHUNK_SIZE; // Always ask for 128KB
+
+            cout << "  Aggressive Re-ahead: requesting " << readahead_size << " bytes from offset " << readahead_offset << endl;
+
+            vector<char> readahead_buf(readahead_size);
             size_t server_got = 0;
 
-            int rr = do_read(serverfd, rbuf.data(), CACHE_BLOCK_SIZE, block_start_offset, &server_got);
+            int rr = do_read(serverfd, readahead_buf.data(), readahead_size, readahead_offset, &server_got);
             if (rr < 0) return rr;
             if (server_got == 0) break; // EOF
 
-            // Store the (potentially partial) block in cache
-            cache_put_block(key, rbuf.data(), server_got);
+            // --- POPULATE CACHE ---
+            // Now, chunk the readahead_buf and populate the cache
+            size_t bytes_cached = 0;
+            uint64_t current_block_idx = b;
+            while (bytes_cached < server_got)
+            {
+                size_t chunk_to_cache = min(CACHE_BLOCK_SIZE, server_got - bytes_cached);
+                string current_key = make_block_key(spath, current_block_idx);
+                
+                cout << "  Populating cache for key=" << current_key << " len=" << chunk_to_cache << endl;
+                cache_put_block(current_key, readahead_buf.data() + bytes_cached, chunk_to_cache);
+                
+                bytes_cached += chunk_to_cache;
+                current_block_idx++;
+            }
 
-            memcpy(tmpblock, rbuf.data(), server_got);
-            got_block_len = server_got;
+            // --- GET DATA FOR *THIS* BLOCK ---
+            // Now that the cache is populated, get the block we originally missed.
+            // This is now guaranteed to be a cache hit.
+            in_cache = cache_get_block(key, tmpblock, got_block_len);
+            if (!in_cache) {
+                // This should never happen if logic is correct
+                cerr << "FATAL: Read-ahead failed to cache block " << key << endl;
+                return -EIO;
+            }
         }
 
         // ---- Copy requested range from block into user buffer ----
         
-        // Check how many bytes are *actually available* to copy from this block
         size_t avail_in_block = (got_block_len > within_block_offset)
                                     ? (got_block_len - within_block_offset)
                                     : 0;
@@ -1178,9 +1199,8 @@ static int nf_read(const char *path, char *buf, size_t size, off_t offset, struc
             bytes_filled += to_copy;
         }
 
-        // If we copied less than we wanted, we hit EOF (or a short read)
         if (to_copy < want_from_this_block)
-            break;
+            break; // Hit EOF (short read)
     }
 
     cout << "  Total bytes read: " << bytes_filled << endl;
