@@ -46,9 +46,17 @@ echo "Server running with PID $SERVER_PID"
 
 sleep 1  # give server time to start
 
-./client.o mntdir 127.0.0.1 3030 -f > client.log 2>&1  &
+./client.o mntdir 127.0.0.1 3030 -f -o attr_timeout=60 -o entry_timeout=60 > client.log 2>&1  &
+# -o attr_timeout=60 -o entry_timeout=60
+
 CLIENT_PID=$!
 echo "Client running with PID $CLIENT_PID"
 
 # Wait for both to finish or Ctrl+C
 wait "$SERVER_PID" "$CLIENT_PID"
+
+
+# ---------------------------------------
+# Write a 100MB file using 4KB blocks.
+# This will do many sequential writes before one final close.
+# dd if=/dev/zero of=/mnt/your-mount/testfile.dat bs=4k count=25600

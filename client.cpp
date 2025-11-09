@@ -1,18 +1,8 @@
-// client.cpp
-// Integrated Network FUSE client with:
-//  - Asynchronous write batching (1 MiB threshold, 100 ms flush interval)
-//  - Client-side LRU block cache (4 KiB blocks, 16 MiB capacity)
-//  - Precise per-request metrics logging (CSV)
-//  - Uses single persistent TCP connection and the same framing used by nfuse_client_with_cache_and_metrics
-//
-// Notes:
-//  - The server must understand OP_WRITE_BATCH (value 100) which carries multiple write entries.
-//    If your server does not support this, change send_batch_to_server to send multiple OP_WRITE frames
-//    or update server accordingly.
-//  - The metrics CSV header used is: timestamp_us,opcode,latency_us,bytes_sent,bytes_recv,cache
-//
-// Build:
-//  g++ -std=gnu++17 -O2 -Wall -pthread `pkg-config fuse3 --cflags --libs` -o client client.cpp
+// nfuse_client_with_cache_and_metrics.cpp
+// Rewritten FUSE client with:
+// 1. Client-side LRU block cache with a 10-second timeout.
+// 2. Per-file-handle, sequential-only, write-behind batching.
+// 3. Robust per-request metrics logging (timestamp, opcode, latency_us, bytes_sent, bytes_recv, cache_hit/miss).
 
 #define FUSE_USE_VERSION 35
 
@@ -39,15 +29,13 @@
 #include <sstream>
 #include <iostream>
 #include <algorithm>
-#include <thread>
-#include <condition_variable>
-#include <atomic>
 
 using namespace std;
 
-#define CHUNK_SIZE 131072
+#define CHUNK_SIZE 131072 // 128 KB chunk size for network ops
 
 // ----------------------------- Operation enum -----------------------------
+// This must match the enum in utils.cpp
 enum Op : uint32_t
 {
     OP_GETATTR = 1,
@@ -63,47 +51,33 @@ enum Op : uint32_t
     OP_UTIMENS = 11,
     OP_STATFS = 12,
     OP_RELEASE = 13,
-    OP_WRITE_BATCH = 14, // custom batch write op
+    OP_WRITE_BATCH = 14 // Added for logging batched writes
 };
 
 static string opcode_to_string(uint32_t op)
 {
     switch (op)
     {
-    case OP_GETATTR:
-        return "GETATTR";
-    case OP_READDIR:
-        return "READDIR";
-    case OP_OPEN:
-        return "OPEN";
-    case OP_READ:
-        return "READ";
-    case OP_WRITE:
-        return "WRITE";
-    case OP_CREATE:
-        return "CREATE";
-    case OP_UNLINK:
-        return "UNLINK";
-    case OP_MKDIR:
-        return "MKDIR";
-    case OP_RMDIR:
-        return "RMDIR";
-    case OP_TRUNCATE:
-        return "TRUNCATE";
-    case OP_UTIMENS:
-        return "UTIMENS";
-    case OP_STATFS:
-        return "STATFS";
-    case OP_RELEASE:
-        return "RELEASE";
-    case OP_WRITE_BATCH:
-        return "WRITE_BATCH";
-    default:
-        return "UNKNOWN";
+    case OP_GETATTR: return "GETATTR";
+    case OP_READDIR: return "READDIR";
+    case OP_OPEN: return "OPEN";
+    case OP_READ: return "READ";
+    case OP_WRITE: return "WRITE";
+    case OP_CREATE: return "CREATE";
+    case OP_UNLINK: return "UNLINK";
+    case OP_MKDIR: return "MKDIR";
+    case OP_RMDIR: return "RMDIR";
+    case OP_TRUNCATE: return "TRUNCATE";
+    case OP_UTIMENS: return "UTIMENS";
+    case OP_STATFS: return "STATFS";
+    case OP_RELEASE: return "RELEASE";
+    case OP_WRITE_BATCH: return "WRITE_BATCH"; // Added
+    default: return "UNKNOWN";
     }
 }
 
 // ------------------------------ Metrics logger ----------------------------
+// Writes CSV lines: timestamp_us,opcode,latency_us,bytes_sent,bytes_recv,cache
 class MetricLogger
 {
     mutex mtx;
@@ -113,12 +87,14 @@ class MetricLogger
 public:
     MetricLogger(const string &fname = "metrics.csv") : filename(fname)
     {
+        // Open in append mode; if file is new/empty write header
         out.open(filename, ios::app);
         if (!out.is_open())
         {
-            cerr << "Warning: cannot open metrics file '" << filename << "' for appending";
+            cerr << "Warning: cannot open metrics file '" << filename << "' for appending\n";
             return;
         }
+        // If file is empty, write header. Check size by seeking
         out.seekp(0, ios::end);
         if (out.tellp() == 0)
         {
@@ -127,6 +103,7 @@ public:
         }
     }
 
+    // Logs a single filesystem operation metric
     void log(const string &opcode, long latency_us, size_t bytes_sent, size_t bytes_recv, const string &cache_status)
     {
         lock_guard<mutex> lk(mtx);
@@ -135,123 +112,242 @@ public:
         using namespace chrono;
         auto now = duration_cast<microseconds>(system_clock::now().time_since_epoch()).count();
         out << now << "," << opcode << "," << latency_us << "," << bytes_sent << "," << bytes_recv << "," << cache_status << "\n";
-        out.flush();
+        out.flush(); // Flush to ensure data is written
     }
 };
 
-static MetricLogger metrics;
+static MetricLogger metrics; // Global metrics logger instance
 
 // --------------------------- Global socket state ---------------------------
 static int sockfd = -1;
-static mutex sock_mtx;
+static mutex sock_mtx; // Mutex to protect all read/write access to sockfd
 
 // ---------------------------- Caching parameters ---------------------------
 static const size_t CACHE_BLOCK_SIZE = 4096;                 // 4KB blocks
 static const size_t CACHE_CAPACITY_BYTES = 16 * 1024 * 1024; // 16 MB total cache
+static const chrono::seconds CACHE_TIMEOUT(100);              // 10-second cache timeout
 
 // ------------------------------- Cache types ------------------------------
+// Value stored in the read cache
 struct CacheValue
 {
     string data; // actual bytes
     size_t size; // data.size()
+    chrono::steady_clock::time_point timestamp; // For timeout
 };
+
+// LRU list of (key, value) pairs
 using LRUList = list<pair<string, CacheValue>>;
 
 static mutex cache_mtx;
-static LRUList lru_list;
-static unordered_map<string, LRUList::iterator> cache_map;
-static size_t cache_size_bytes = 0;
+static LRUList lru_list; // Holds the cache entries in LRU order (front = newest)
+static unordered_map<string, LRUList::iterator> cache_map; // Maps key -> iterator in lru_list
+static size_t cache_size_bytes = 0; // Current total size of data in cache
 
 // Map serverfd -> path so we can invalidate by fd on release
 static mutex fdpath_mtx;
 static unordered_map<uint64_t, string> fd_to_path;
 
+// Evicts least-recently-used items until cache is under capacity
 static void cache_evict_if_needed()
 {
     while (cache_size_bytes > CACHE_CAPACITY_BYTES && !lru_list.empty())
     {
+        // Get the least-recently-used item (back of the list)
         auto it = prev(lru_list.end());
         size_t entry_size = it->second.size;
+        
+        // Remove from both map and list
         cache_map.erase(it->first);
         cache_size_bytes -= entry_size;
         lru_list.pop_back();
     }
 }
 
+// Puts a block of data into the LRU cache
 static void cache_put_block(const string &key, const char *data, size_t len)
 {
     if (len > CACHE_CAPACITY_BYTES)
-        return;
+        return; // Don't cache blocks larger than the cache itself
+    
     lock_guard<mutex> lk(cache_mtx);
 
     auto it = cache_map.find(key);
     if (it != cache_map.end())
     {
+        // --- Update existing entry ---
         auto lit = it->second;
-        cache_size_bytes -= lit->second.size;
+        cache_size_bytes -= lit->second.size; // Subtract old size
+        
+        // Update data, size, and timestamp
         lit->second.data.assign(data, data + len);
         lit->second.size = len;
-        cache_size_bytes += len;
+        lit->second.timestamp = chrono::steady_clock::now();
+        
+        cache_size_bytes += len; // Add new size
+        
+        // Move to front of LRU list
         lru_list.splice(lru_list.begin(), lru_list, lit);
     }
     else
     {
+        // --- Add new entry ---
         CacheValue cv;
         cv.data.assign(data, data + len);
         cv.size = len;
+        cv.timestamp = chrono::steady_clock::now();
+        
+        // Add to front of list
         lru_list.emplace_front(key, std::move(cv));
+        // Store iterator in map
         cache_map[key] = lru_list.begin();
         cache_size_bytes += len;
     }
 
+    // Evict old entries if we're over capacity
     cache_evict_if_needed();
 }
 
+// Tries to read a block from cache. Returns true if present and not stale.
 static bool cache_get_block(const string &key, char *out_buf, size_t &out_len)
 {
     lock_guard<mutex> lk(cache_mtx);
     auto it = cache_map.find(key);
     if (it == cache_map.end())
-        return false;
+        return false; // Not in cache
+
+    // --- Check for staleness ---
+    auto age = chrono::steady_clock::now() - it->second->second.timestamp;
+    if (age > CACHE_TIMEOUT)
+    {
+        // Cache entry is stale. Evict it and report a miss.
+        cache_size_bytes -= it->second->second.size;
+        lru_list.erase(it->second);
+        cache_map.erase(it);
+        return false; // Stale, treat as miss
+    }
+
+    // --- Cache hit and not stale ---
+    
+    // Move to front of LRU list
     lru_list.splice(lru_list.begin(), lru_list, it->second);
+    
+    // Copy data out
     const CacheValue &cv = it->second->second;
     memcpy(out_buf, cv.data.data(), cv.size);
     out_len = cv.size;
+    
     return true;
 }
 
+// Remove all blocks for a full path (prefix matching "path:")
 static void cache_invalidate_path(const string &path)
 {
     lock_guard<mutex> lk(cache_mtx);
     string prefix = path + ":";
+    
+    // Iterate and remove all entries whose keys start with "path:"
     for (auto it = lru_list.begin(); it != lru_list.end();)
     {
-        if (it->first.rfind(prefix, 0) == 0)
+        if (it->first.rfind(prefix, 0) == 0) // Check for prefix
         {
             cache_size_bytes -= it->second.size;
             cache_map.erase(it->first);
-            it = lru_list.erase(it);
+            it = lru_list.erase(it); // Erase and move to next valid iterator
         }
         else
             ++it;
     }
 }
 
+// Remove exactly one key (e.g., after a write)
 static void cache_erase_key(const string &key)
 {
     lock_guard<mutex> lk(cache_mtx);
     auto it = cache_map.find(key);
     if (it == cache_map.end())
         return;
+        
     cache_size_bytes -= it->second->second.size;
     lru_list.erase(it->second);
     cache_map.erase(it);
 }
 
+// Creates a unique key for a file block, e.g., "/data/file.txt:1"
 static string make_block_key(const string &path, uint64_t block_idx)
 {
     return path + ":" + to_string(block_idx);
 }
+
+// --------------------------- Write Batching State --------------------------
+static const size_t BATCH_WRITE_THRESHOLD = 1 * 1024 * 1024; // 1 MB
+static mutex g_write_buffer_mtx;
+// We use std::string as a dynamic byte buffer
+static unordered_map<uint64_t, string> g_write_buffers;
+static unordered_map<uint64_t, off_t> g_write_buffer_start_offsets;
+
+// Forward declaration
+static int do_batch_write(uint64_t serverfd, const char *buf, size_t size, off_t offset, size_t *out_written);
+
+// Flushes the write buffer for a given file handle
+// This function MUST be called with g_write_buffer_mtx *unlocked* or with lock=false if already locked.
+static int flush_write_buffer(uint64_t serverfd, bool lock = true)
+{
+    string buffer;
+    off_t start_offset = 0;
+    
+    // Scope for the lock
+    {
+        unique_lock<mutex> lk(g_write_buffer_mtx, defer_lock);
+        if (lock) lk.lock();
+
+        auto it = g_write_buffers.find(serverfd);
+        if (it == g_write_buffers.end() || it->second.empty())
+        {
+            return 0; // Nothing to flush
+        }
+        
+        // Move the buffer out of the map atomically
+        buffer = std::move(it->second);
+        start_offset = g_write_buffer_start_offsets[serverfd];
+        
+        // Clear the map entries
+        g_write_buffers.erase(it);
+        g_write_buffer_start_offsets.erase(serverfd);
+    }
+    
+    cout << "Flushing write buffer for fd=" << serverfd 
+         << ", size=" << buffer.size() 
+         << ", offset=" << start_offset << endl;
+         
+    size_t wrote = 0;
+    int r = do_batch_write(serverfd, buffer.data(), buffer.size(), start_offset, &wrote);
+    
+    if (r < 0) return r;
+    if (wrote != buffer.size()) return -EIO; // Short write on flush is an error
+
+    // Invalidate read cache for the blocks we just wrote
+    string spath;
+    {
+        lock_guard<mutex> lk(fdpath_mtx);
+        auto it = fd_to_path.find(serverfd);
+        if (it != fd_to_path.end())
+            spath = it->second;
+    }
+    if (!spath.empty())
+    {
+        uint64_t first_block = (uint64_t)start_offset / CACHE_BLOCK_SIZE;
+        uint64_t last_block = (uint64_t)(start_offset + wrote - 1) / CACHE_BLOCK_SIZE;
+        for (uint64_t b = first_block; b <= last_block; ++b)
+        {
+            string key = make_block_key(spath, b);
+            cache_erase_key(key);
+        }
+    }
+    
+    return 0;
+}
+
 
 // ----------------------------- Helper that prints errno and exits
 static void die(const char *m)
@@ -292,6 +388,7 @@ static int connect_to_server(const char *host, const char *port)
     return s;
 }
 
+// Reads exactly n bytes from fd into buf
 static int readn(int fd, void *buf, size_t n)
 {
     size_t left = n;
@@ -304,16 +401,17 @@ static int readn(int fd, void *buf, size_t n)
         {
             if (errno == EINTR)
                 continue;
-            return -1;
+            return -1; // Error
         }
         if (r == 0)
-            return 0;
+            return 0; // EOF
         left -= r;
         p += r;
     }
     return (int)n;
 }
 
+// Writes exactly n bytes from buf to fd
 static int writen(int fd, const void *buf, size_t n)
 {
     size_t left = n;
@@ -326,124 +424,143 @@ static int writen(int fd, const void *buf, size_t n)
         {
             if (errno == EINTR)
                 continue;
-            return -1;
+            return -1; // Error
         }
         if (w == 0)
-            return 0;
+            return 0; // Should not happen for sockets
         left -= w;
         p += w;
     }
     return (int)n;
 }
 
-// send_frame_and_recv: writes 4-byte BE length + payload, then reads status(4)|dlen(4)|data
-// Returns 0 on success. On success returns latency_us, bytes_sent and bytes_recv to caller.
-static int send_frame_and_recv(const void *payload, uint32_t payload_len, vector<char> &out_status_and_data,
+// Core network protocol function.
+// Sends a 4-byte BE length + payload.
+// Receives a 4-byte BE status + 4-byte BE dlen + data.
+// Returns 0 on success.
+// On success, logs metrics and populates out_latency_us, out_bytes_sent, out_bytes_recv.
+static int send_frame_and_recv(uint32_t opcode, const void *payload, uint32_t payload_len, 
+                               vector<char> &out_resp_data,
                                long &out_latency_us, size_t &out_bytes_sent, size_t &out_bytes_recv)
 {
     using namespace chrono;
     auto start = high_resolution_clock::now();
 
-    unique_lock<mutex> lk(sock_mtx);
+    unique_lock<mutex> lk(sock_mtx); // Lock the socket for this entire transaction
 
-    uint32_t len_be = htonl(payload_len);
+    // --- Send request ---
+    // 4-byte length prefix (opcode + payload)
+    uint32_t total_len = 4 + payload_len;
+    uint32_t len_be = htonl(total_len);
     if (writen(sockfd, &len_be, sizeof(len_be)) != (int)sizeof(len_be))
         return -EIO;
+    
+    // 4-byte opcode
+    uint32_t op_be = htonl(opcode);
+    if (writen(sockfd, &op_be, sizeof(op_be)) != (int)sizeof(op_be))
+        return -EIO;
+
+    // Payload
     if (payload_len > 0 && writen(sockfd, payload, payload_len) != (int)payload_len)
         return -EIO;
 
+    // --- Receive response ---
     uint32_t status_be, dlen_be;
+    // 4-byte status
     if (readn(sockfd, &status_be, sizeof(status_be)) != (int)sizeof(status_be))
         return -EIO;
+    // 4-byte data length
     if (readn(sockfd, &dlen_be, sizeof(dlen_be)) != (int)sizeof(dlen_be))
         return -EIO;
+    
+    uint32_t status = ntohl(status_be);
     uint32_t dlen = ntohl(dlen_be);
-    out_status_and_data.resize(4 + dlen);
-    memcpy(out_status_and_data.data(), &status_be, 4);
-    if (dlen && readn(sockfd, out_status_and_data.data() + 4, dlen) != (int)dlen)
+
+    // Resize output vector to hold status + data
+    out_resp_data.resize(4 + dlen);
+    memcpy(out_resp_data.data(), &status_be, 4); // Copy status in
+
+    // Read data payload if present
+    if (dlen && readn(sockfd, out_resp_data.data() + 4, dlen) != (int)dlen)
         return -EIO;
 
+    lk.unlock(); // Unlock socket
+    
     auto end = high_resolution_clock::now();
     out_latency_us = duration_cast<microseconds>(end - start).count();
-    out_bytes_sent = sizeof(len_be) + payload_len;               // 4 + payload
-    out_bytes_recv = sizeof(status_be) + sizeof(dlen_be) + dlen; // 8 + dlen
+    
+    // Calculate RTT bytes
+    out_bytes_sent = sizeof(len_be) + sizeof(op_be) + payload_len; // 4 + 4 + payload
+    out_bytes_recv = sizeof(status_be) + sizeof(dlen_be) + dlen;   // 4 + 4 + dlen
 
-    return 0;
+    // Return the status code (0 for success, errno otherwise)
+    return (int)status;
 }
 
 // ------------------------ High level operation helpers ------------------------
+// These helpers format the request payload, call send_frame_and_recv, 
+// log metrics, and parse the response.
+
 static int do_getattr(const char *path, struct stat *stbuf)
 {
     string p(path);
-    uint32_t op_be = htonl(OP_GETATTR);
     uint32_t pathlen_be = htonl(static_cast<uint32_t>(p.size()));
 
     vector<char> payload;
-    payload.insert(payload.end(), reinterpret_cast<char *>(&op_be), reinterpret_cast<char *>(&op_be) + 4);
     payload.insert(payload.end(), reinterpret_cast<char *>(&pathlen_be), reinterpret_cast<char *>(&pathlen_be) + 4);
     payload.insert(payload.end(), p.begin(), p.end());
 
     vector<char> resp;
     long latency_us = 0;
     size_t bytes_sent = 0, bytes_recv = 0;
-    if (send_frame_and_recv(payload.data(), (uint32_t)payload.size(), resp, latency_us, bytes_sent, bytes_recv) != 0)
-        return -EIO;
-
+    
+    int status = send_frame_and_recv(OP_GETATTR, payload.data(), (uint32_t)payload.size(), resp, latency_us, bytes_sent, bytes_recv);
+    
+    // Log the network request
     metrics.log(opcode_to_string(OP_GETATTR), latency_us, bytes_sent, bytes_recv, "none");
 
-    if (resp.size() < 4)
-        return -EIO;
-    uint32_t status;
-    memcpy(&status, resp.data(), 4);
-    if (status != 0)
-        return -EIO;
+    if (status != 0) return -status; // Return -errno
 
     if (resp.size() < 4 + sizeof(struct stat))
         return -EIO;
+        
     memcpy(stbuf, resp.data() + 4, sizeof(struct stat));
-    return 0;
+    return 0; // Success
 }
 
 static int do_readdir(const char *path, void *buf, fuse_fill_dir_t filler)
 {
     string p(path);
-    uint32_t op_be = htonl(OP_READDIR);
     uint32_t pathlen_be = htonl(static_cast<uint32_t>(p.size()));
 
     vector<char> payload;
-    payload.insert(payload.end(), reinterpret_cast<char *>(&op_be), reinterpret_cast<char *>(&op_be) + 4);
     payload.insert(payload.end(), reinterpret_cast<char *>(&pathlen_be), reinterpret_cast<char *>(&pathlen_be) + 4);
     payload.insert(payload.end(), p.begin(), p.end());
 
     vector<char> resp;
     long latency_us = 0;
     size_t bytes_sent = 0, bytes_recv = 0;
-    if (send_frame_and_recv(payload.data(), (uint32_t)payload.size(), resp, latency_us, bytes_sent, bytes_recv) != 0)
-        return -EIO;
+    
+    int status = send_frame_and_recv(OP_READDIR, payload.data(), (uint32_t)payload.size(), resp, latency_us, bytes_sent, bytes_recv);
 
     metrics.log(opcode_to_string(OP_READDIR), latency_us, bytes_sent, bytes_recv, "none");
 
-    if (resp.size() < 4)
-        return -EIO;
-    uint32_t status;
-    memcpy(&status, resp.data(), 4);
-    if (status != 0)
-        return -(int)status;
+    if (status != 0) return -status;
 
+    // Parse the 0-terminated string blob
     const char *ptr = resp.data() + 4;
     size_t len = resp.size() - 4;
     size_t i = 0;
     while (i < len)
     {
-        if (ptr[i] == ' ')
-        {
-            ++i;
-            continue;
-        }
         const char *name = ptr + i;
         size_t nlen = strlen(name);
+        if (nlen == 0) { // Should only happen at the end, but good to check
+             ++i;
+             continue;
+        }
         filler(buf, name, NULL, 0, static_cast<fuse_fill_dir_flags>(0));
-        i += nlen + 1;
+        i += nlen + 1; // Move past name and null terminator
     }
     return 0;
 }
@@ -451,12 +568,11 @@ static int do_readdir(const char *path, void *buf, fuse_fill_dir_t filler)
 static int do_open_or_create(const char *path, int flags, int mode, bool create, uint64_t &out_serverfd)
 {
     string p(path);
-    uint32_t op_be = htonl(create ? OP_CREATE : OP_OPEN);
+    uint32_t op = create ? OP_CREATE : OP_OPEN;
     uint32_t pathlen_be = htonl(static_cast<uint32_t>(p.size()));
     uint32_t flags_be = htonl(static_cast<uint32_t>(flags));
 
     vector<char> payload;
-    payload.insert(payload.end(), reinterpret_cast<char *>(&op_be), reinterpret_cast<char *>(&op_be) + 4);
     payload.insert(payload.end(), reinterpret_cast<char *>(&pathlen_be), reinterpret_cast<char *>(&pathlen_be) + 4);
     payload.insert(payload.end(), p.begin(), p.end());
     payload.insert(payload.end(), reinterpret_cast<char *>(&flags_be), reinterpret_cast<char *>(&flags_be) + 4);
@@ -470,24 +586,19 @@ static int do_open_or_create(const char *path, int flags, int mode, bool create,
     vector<char> resp;
     long latency_us = 0;
     size_t bytes_sent = 0, bytes_recv = 0;
-    if (send_frame_and_recv(payload.data(), (uint32_t)payload.size(), resp, latency_us, bytes_sent, bytes_recv) != 0)
-        return -EIO;
+    int status = send_frame_and_recv(op, payload.data(), (uint32_t)payload.size(), resp, latency_us, bytes_sent, bytes_recv);
 
-    metrics.log(opcode_to_string(create ? OP_CREATE : OP_OPEN), latency_us, bytes_sent, bytes_recv, "none");
+    metrics.log(opcode_to_string(op), latency_us, bytes_sent, bytes_recv, "none");
 
-    if (resp.size() < 4)
-        return -EIO;
-    uint32_t status;
-    memcpy(&status, resp.data(), 4);
-    if (status != 0)
-        return -(int)status;
+    if (status != 0) return -status;
 
-    if (resp.size() < 4 + 8)
-        return -EIO;
+    if (resp.size() < 4 + 8) return -EIO;
+    
     uint64_t fdbe;
     memcpy(&fdbe, resp.data() + 4, 8);
     out_serverfd = be64toh(fdbe);
 
+    // Store path for this fd for cache invalidation
     {
         lock_guard<mutex> lk(fdpath_mtx);
         fd_to_path[out_serverfd] = p;
@@ -495,22 +606,21 @@ static int do_open_or_create(const char *path, int flags, int mode, bool create,
     return 0;
 }
 
+// Network read helper
 static int do_read(uint64_t serverfd, char *buf, size_t size, off_t offset, size_t *out_read)
 {
     size_t total_read = 0;
-    char chunkbuf[CHUNK_SIZE];
 
+    // We must chunk reads to respect our CHUNK_SIZE protocol limit
     while (total_read < size)
     {
         size_t this_chunk = std::min((size_t)CHUNK_SIZE, size - total_read);
 
-        uint32_t op_be = htonl(OP_READ);
         uint64_t fd_be = htobe64(serverfd);
         uint64_t off_be = htobe64((uint64_t)(offset + total_read));
         uint32_t size_be = htonl(static_cast<uint32_t>(this_chunk));
 
         vector<char> payload;
-        payload.insert(payload.end(), reinterpret_cast<char *>(&op_be), reinterpret_cast<char *>(&op_be) + 4);
         payload.insert(payload.end(), reinterpret_cast<char *>(&fd_be), reinterpret_cast<char *>(&fd_be) + 8);
         payload.insert(payload.end(), reinterpret_cast<char *>(&off_be), reinterpret_cast<char *>(&off_be) + 8);
         payload.insert(payload.end(), reinterpret_cast<char *>(&size_be), reinterpret_cast<char *>(&size_be) + 4);
@@ -518,26 +628,23 @@ static int do_read(uint64_t serverfd, char *buf, size_t size, off_t offset, size
         vector<char> resp;
         long latency_us = 0;
         size_t bytes_sent = 0, bytes_recv = 0;
-        if (send_frame_and_recv(payload.data(), (uint32_t)payload.size(), resp, latency_us, bytes_sent, bytes_recv) != 0)
-            return -EIO;
+        int status = send_frame_and_recv(OP_READ, payload.data(), (uint32_t)payload.size(), resp, latency_us, bytes_sent, bytes_recv);
 
+        // mark this network-backed read as a cache MISS for metrics purposes
         metrics.log(opcode_to_string(OP_READ), latency_us, bytes_sent, bytes_recv, "miss");
-
-        if (resp.size() < 4)
-            return -EIO;
-        uint32_t status;
-        memcpy(&status, resp.data(), 4);
-        if (status != 0)
-            return -(int)status;
+        
+        if (status != 0) return -status;
 
         size_t dlen = resp.size() - 4;
         if (dlen == 0)
-            break; // EOF
+            break; // Server returned 0 bytes (EOF)
 
         if (buf)
             memcpy(buf + total_read, resp.data() + 4, dlen);
 
         total_read += dlen;
+        
+        // If server returned less than we asked for, we hit EOF
         if (dlen < this_chunk)
             break;
     }
@@ -546,287 +653,21 @@ static int do_read(uint64_t serverfd, char *buf, size_t size, off_t offset, size
     return 0;
 }
 
-// ----------------------- Asynchronous Write Batch Manager ------------------
-
-struct WriteEntry
+// Network write helper (for regular, non-batched writes)
+static int do_write(uint64_t serverfd, const char *buf, size_t size, off_t offset, size_t *out_written)
 {
-    uint64_t offset;
-    std::vector<char> data; // move-friendly
-};
-
-class WriteBatchManager
-{
-public:
-    WriteBatchManager() : running_(true), worker_(&WriteBatchManager::worker_loop, this) {}
-    ~WriteBatchManager()
-    {
-        stop_and_flush();
-        if (worker_.joinable()) worker_.join();
-    }
-
-    void add_write(uint64_t sfd, const char *buf, size_t size, uint64_t offset)
-    {
-        if (size == 0) return;
-        {
-            std::unique_lock<std::mutex> maplk(map_mutex_);
-            auto &batch = batches_[sfd];
-            {
-                std::unique_lock<std::mutex> lk(batch.mutex);
-                batch.entries.emplace_back(WriteEntry{offset, std::vector<char>(buf, buf + size)});
-                batch.total_size += size;
-                batch.dirty = true;
-            }
-        }
-        cv_.notify_one();
-    }
-
-    void flush_sfd(uint64_t sfd)
-    {
-        std::unique_lock<std::mutex> maplk(map_mutex_);
-        auto it = batches_.find(sfd);
-        if (it == batches_.end()) return;
-        auto &batch = it->second;
-        std::unique_lock<std::mutex> lk(batch.mutex);
-        if (!batch.entries.empty())
-        {
-            send_batch_to_server_locked(sfd, batch);
-            batch.entries.clear();
-            batch.total_size = 0;
-            batch.dirty = false;
-        }
-    }
-
-    void flush_all()
-    {
-        std::unique_lock<std::mutex> maplk(map_mutex_);
-        for (auto &p : batches_)
-        {
-            auto &sfd = p.first;
-            auto &batch = p.second;
-            std::unique_lock<std::mutex> lk(batch.mutex);
-            if (!batch.entries.empty())
-            {
-                send_batch_to_server_locked(sfd, batch);
-                batch.entries.clear();
-                batch.total_size = 0;
-                batch.dirty = false;
-            }
-        }
-    }
-
-    void stop_and_flush()
-    {
-        running_.store(false);
-        cv_.notify_one();
-        flush_all();
-    }
-
-private:
-    struct Batch
-    {
-        std::mutex mutex;
-        std::vector<WriteEntry> entries;
-        size_t total_size = 0;
-        bool dirty = false;
-    };
-
-    std::unordered_map<uint64_t, Batch> batches_;
-    std::mutex map_mutex_;
-    std::condition_variable cv_;
-    std::atomic<bool> running_;
-    std::thread worker_;
-
-    const size_t THRESHOLD = 1 * 1024 ; // 1 MiB
-    const std::chrono::milliseconds INTERVAL = std::chrono::milliseconds(100);
-
-    void worker_loop()
-    {
-        std::unique_lock<std::mutex> lk(map_mutex_);
-        while (running_.load())
-        {
-            cv_.wait_for(lk, INTERVAL);
-            std::vector<uint64_t> to_check;
-            to_check.reserve(batches_.size());
-            for (auto &p : batches_) to_check.push_back(p.first);
-            lk.unlock();
-
-            for (auto sfd : to_check)
-            {
-                std::unique_lock<std::mutex> maplk(map_mutex_);
-                auto it = batches_.find(sfd);
-                if (it == batches_.end())
-                {
-                    maplk.unlock();
-                    continue;
-                }
-                auto &batch = it->second;
-                maplk.unlock();
-
-                std::unique_lock<std::mutex> bl(batch.mutex);
-                if (batch.total_size >= THRESHOLD || batch.dirty)
-                {
-                    if (!batch.entries.empty())
-                    {
-                        send_batch_to_server_locked(sfd, batch);
-                        batch.entries.clear();
-                        batch.total_size = 0;
-                        batch.dirty = false;
-                    }
-                }
-            }
-
-            lk.lock();
-        }
-    }
-
-    void send_batch_range_locked(uint64_t sfd, const std::vector<WriteEntry> &entries, size_t start, size_t end)
-    {
-        // Build payload with OP_WRITE_BATCH and entries [start,end)
-        uint32_t op_be = htonl(OP_WRITE_BATCH);
-        uint64_t sfd_be = htobe64(sfd);
-        uint32_t count_be = htonl((uint32_t)(end - start));
-
-        uint64_t body_len = 4 + 8 + 4; // op + sfd + count
-        for (size_t i = start; i < end; ++i)
-            body_len += 8 + 4 + entries[i].data.size();
-
-        if (body_len > UINT32_MAX) return; // guard
-        uint32_t body32 = (uint32_t)body_len;
-
-        vector<char> payload;
-        payload.reserve(body32);
-        // op
-        payload.insert(payload.end(), reinterpret_cast<char *>(&op_be), reinterpret_cast<char *>(&op_be) + 4);
-        // sfd
-        payload.insert(payload.end(), reinterpret_cast<char *>(&sfd_be), reinterpret_cast<char *>(&sfd_be) + 8);
-        // count
-        payload.insert(payload.end(), reinterpret_cast<char *>(&count_be), reinterpret_cast<char *>(&count_be) + 4);
-        // entries
-        for (size_t i = start; i < end; ++i)
-        {
-            uint64_t off_be = htobe64(entries[i].offset);
-            uint32_t sz_be = htonl((uint32_t)entries[i].data.size());
-            payload.insert(payload.end(), reinterpret_cast<char *>(&off_be), reinterpret_cast<char *>(&off_be) + 8);
-            payload.insert(payload.end(), reinterpret_cast<char *>(&sz_be), reinterpret_cast<char *>(&sz_be) + 4);
-            payload.insert(payload.end(), entries[i].data.begin(), entries[i].data.end());
-        }
-
-        vector<char> resp;
-        long latency_us = 0;
-        size_t bytes_sent = 0, bytes_recv = 0;
-        if (send_frame_and_recv(payload.data(), (uint32_t)payload.size(), resp, latency_us, bytes_sent, bytes_recv) != 0)
-        {
-            cerr << "batch send failed for sfd=" << sfd << "";
-            return;
-        }
-        metrics.log(opcode_to_string(OP_WRITE_BATCH), latency_us, bytes_sent, bytes_recv, "none");
-        // Optionally parse server status in resp
-    }
-
-    void send_batch_to_server_locked(uint64_t sfd, Batch &batch)
-    {
-        // Might need to split into multiple frames to stay under UINT32_MAX
-        size_t i = 0;
-        while (i < batch.entries.size())
-        {
-            uint64_t sub_body = 4 + 8 + 4;
-            size_t j = i;
-            for (; j < batch.entries.size(); ++j)
-            {
-                if (sub_body + 8 + 4 + batch.entries[j].data.size() > UINT32_MAX)
-                    break;
-                sub_body += 8 + 4 + batch.entries[j].data.size();
-            }
-            if (j == i) {
-                // single entry too large? send it synchronously as OP_WRITE
-                const auto &e = batch.entries[i];
-                send_single_write_sync(sfd, e.offset, e.data.data(), e.data.size());
-                ++i;
-            } else {
-                send_batch_range_locked(sfd, batch.entries, i, j);
-                i = j;
-            }
-        }
-    }
-
-    void send_single_write_sync(uint64_t sfd, uint64_t offset, const char *data, size_t len)
-    {
-        // Fallback to OP_WRITE (synchronous) for huge single writes
-        uint32_t op_be = htonl(OP_WRITE);
-        uint64_t fd_be = htobe64(sfd);
-        uint64_t off_be = htobe64(offset);
-        uint32_t size_be = htonl((uint32_t)len);
-
-        vector<char> payload;
-        payload.insert(payload.end(), reinterpret_cast<char *>(&op_be), reinterpret_cast<char *>(&op_be) + 4);
-        payload.insert(payload.end(), reinterpret_cast<char *>(&fd_be), reinterpret_cast<char *>(&fd_be) + 8);
-        payload.insert(payload.end(), reinterpret_cast<char *>(&off_be), reinterpret_cast<char *>(&off_be) + 8);
-        payload.insert(payload.end(), reinterpret_cast<char *>(&size_be), reinterpret_cast<char *>(&size_be) + 4);
-        payload.insert(payload.end(), data, data + len);
-
-        vector<char> resp;
-        long latency_us = 0;
-        size_t bytes_sent = 0, bytes_recv = 0;
-        if (send_frame_and_recv(payload.data(), (uint32_t)payload.size(), resp, latency_us, bytes_sent, bytes_recv) != 0)
-        {
-            cerr << "sync single write failed for sfd=" << sfd << "";
-            return;
-        }
-        metrics.log(opcode_to_string(OP_WRITE), latency_us, bytes_sent, bytes_recv, "none");
-    }
-};
-
-static WriteBatchManager *g_batch_manager = nullptr;
-
-// ------------------------ High-level write integration ---------------------
-// The original do_write performed synchronous writes; we now enqueue writes into the batch manager.
-
-static int do_write_async(uint64_t serverfd, const char *buf, size_t size, off_t offset, size_t *out_written)
-{
-    // Invalidate cache blocks covering this range immediately (so subsequent reads see new data or refetch)
-    string spath;
-    {
-        lock_guard<mutex> lk(fdpath_mtx);
-        auto it = fd_to_path.find(serverfd);
-        if (it != fd_to_path.end())
-            spath = it->second;
-    }
-    if (!spath.empty())
-    {
-        uint64_t first_block = (uint64_t)offset / CACHE_BLOCK_SIZE;
-        uint64_t last_block = (uint64_t)(offset + size - 1) / CACHE_BLOCK_SIZE;
-        for (uint64_t b = first_block; b <= last_block; ++b)
-        {
-            string key = make_block_key(spath, b);
-            cache_erase_key(key);
-        }
-    }
-
-    // Enqueue to batch manager and return optimistic result
-    if (!g_batch_manager)
-        return -EIO;
-    g_batch_manager->add_write(serverfd, buf, size, (uint64_t)offset);
-    *out_written = size;
-    return 0;
-}
-
-// ------------------------ Other helpers (do_unlink/do_truncate/etc) --------
-static int do_write_sync_fallback(uint64_t serverfd, const char *buf, size_t size, off_t offset, size_t *out_written)
-{
-    // Keep the original synchronous writer for safety (chunked)
     size_t total_written = 0;
 
+    // We must chunk writes to respect our CHUNK_SIZE protocol limit
     while (total_written < size)
     {
         size_t this_chunk = std::min((size_t)CHUNK_SIZE, size - total_written);
 
-        uint32_t op_be = htonl(OP_WRITE);
         uint64_t fd_be = htobe64(serverfd);
         uint64_t off_be = htobe64((uint64_t)(offset + total_written));
         uint32_t size_be = htonl(static_cast<uint32_t>(this_chunk));
 
         vector<char> payload;
-        payload.insert(payload.end(), reinterpret_cast<char *>(&op_be), reinterpret_cast<char *>(&op_be) + 4);
         payload.insert(payload.end(), reinterpret_cast<char *>(&fd_be), reinterpret_cast<char *>(&fd_be) + 8);
         payload.insert(payload.end(), reinterpret_cast<char *>(&off_be), reinterpret_cast<char *>(&off_be) + 8);
         payload.insert(payload.end(), reinterpret_cast<char *>(&size_be), reinterpret_cast<char *>(&size_be) + 4);
@@ -835,18 +676,61 @@ static int do_write_sync_fallback(uint64_t serverfd, const char *buf, size_t siz
         vector<char> resp;
         long latency_us = 0;
         size_t bytes_sent = 0, bytes_recv = 0;
-        if (send_frame_and_recv(payload.data(), (uint32_t)payload.size(), resp, latency_us, bytes_sent, bytes_recv) != 0)
-            return -EIO;
+        int status = send_frame_and_recv(OP_WRITE, payload.data(), (uint32_t)payload.size(), resp, latency_us, bytes_sent, bytes_recv);
 
         metrics.log(opcode_to_string(OP_WRITE), latency_us, bytes_sent, bytes_recv, "none");
 
-        if (resp.size() < 8)
-            return -EIO;
-        uint32_t status;
-        memcpy(&status, resp.data(), 4);
-        if (status != 0)
-            return -(int)status;
+        if (status != 0) return -status;
+        
+        if (resp.size() < 4 + 4) return -EIO; // Must have status + bytes_written
+        
+        uint32_t wrote_be;
+        memcpy(&wrote_be, resp.data() + 4, 4);
+        uint32_t wrote = ntohl(wrote_be);
 
+        total_written += wrote;
+        
+        // If server wrote less than we sent, something is wrong (e.g., disk full)
+        if (wrote < this_chunk)
+            break;
+    }
+
+    *out_written = total_written;
+    return 0;
+}
+
+// Network write helper for BATCHED writes (uses different opcode for logging)
+static int do_batch_write(uint64_t serverfd, const char *buf, size_t size, off_t offset, size_t *out_written)
+{
+    size_t total_written = 0;
+
+    // Chunking logic is identical to do_write
+    while (total_written < size)
+    {
+        size_t this_chunk = std::min((size_t)CHUNK_SIZE, size - total_written);
+
+        uint64_t fd_be = htobe64(serverfd);
+        uint64_t off_be = htobe64((uint64_t)(offset + total_written));
+        uint32_t size_be = htonl(static_cast<uint32_t>(this_chunk));
+
+        vector<char> payload;
+        payload.insert(payload.end(), reinterpret_cast<char *>(&fd_be), reinterpret_cast<char *>(&fd_be) + 8);
+        payload.insert(payload.end(), reinterpret_cast<char *>(&off_be), reinterpret_cast<char *>(&off_be) + 8);
+        payload.insert(payload.end(), reinterpret_cast<char *>(&size_be), reinterpret_cast<char *>(&size_be) + 4);
+        payload.insert(payload.end(), buf + total_written, buf + total_written + this_chunk);
+
+        vector<char> resp;
+        long latency_us = 0;
+        size_t bytes_sent = 0, bytes_recv = 0;
+        // *** Use OP_WRITE_BATCH here ***
+        int status = send_frame_and_recv(OP_WRITE_BATCH, payload.data(), (uint32_t)payload.size(), resp, latency_us, bytes_sent, bytes_recv);
+
+        // *** Log as WRITE_BATCH ***
+        metrics.log(opcode_to_string(OP_WRITE_BATCH), latency_us, bytes_sent, bytes_recv, "none");
+        
+        if (status != 0) return -status;
+        if (resp.size() < 4 + 4) return -EIO;
+        
         uint32_t wrote_be;
         memcpy(&wrote_be, resp.data() + 4, 4);
         uint32_t wrote = ntohl(wrote_be);
@@ -861,115 +745,56 @@ static int do_write_sync_fallback(uint64_t serverfd, const char *buf, size_t siz
 }
 
 
-
-
-
-static int do_statfs(const char *path, struct statvfs *stbuf)
-{
-    string p(path);
-    uint32_t op_be = htonl(OP_STATFS);
-    uint32_t pathlen_be = htonl(static_cast<uint32_t>(p.size()));
-
-    vector<char> payload;
-    payload.insert(payload.end(), reinterpret_cast<char *>(&op_be), reinterpret_cast<char *>(&op_be) + 4);
-    payload.insert(payload.end(), reinterpret_cast<char *>(&pathlen_be), reinterpret_cast<char *>(&pathlen_be) + 4);
-    payload.insert(payload.end(), p.begin(), p.end());
-
-    vector<char> resp;
-    long latency_us = 0;
-    size_t bytes_sent = 0, bytes_recv = 0;
-    if (send_frame_and_recv(payload.data(), (uint32_t)payload.size(), resp, latency_us, bytes_sent, bytes_recv) != 0)
-        return -EIO;
-
-    metrics.log(opcode_to_string(OP_STATFS), latency_us, bytes_sent, bytes_recv, "none");
-
-    if (resp.size() < 4 + sizeof(struct statvfs))
-        return -EIO;
-    uint32_t status;
-    memcpy(&status, resp.data(), 4);
-    if (status != 0)
-        return -(int)status;
-    memcpy(stbuf, resp.data() + 4, sizeof(struct statvfs));
-    return 0;
-}
-
-
-
-
-
-
 static int do_release(uint64_t serverfd)
 {
-    uint32_t op_be = htonl(OP_RELEASE);
     uint64_t fd_be = htobe64(serverfd);
 
     vector<char> payload;
-    payload.insert(payload.end(), reinterpret_cast<char *>(&op_be), reinterpret_cast<char *>(&op_be) + 4);
     payload.insert(payload.end(), reinterpret_cast<char *>(&fd_be), reinterpret_cast<char *>(&fd_be) + 8);
 
     vector<char> resp;
     long latency_us = 0;
     size_t bytes_sent = 0, bytes_recv = 0;
-    if (send_frame_and_recv(payload.data(), (uint32_t)payload.size(), resp, latency_us, bytes_sent, bytes_recv) != 0)
-        return -EIO;
+    int status = send_frame_and_recv(OP_RELEASE, payload.data(), (uint32_t)payload.size(), resp, latency_us, bytes_sent, bytes_recv);
 
     metrics.log(opcode_to_string(OP_RELEASE), latency_us, bytes_sent, bytes_recv, "none");
 
-    if (resp.size() < 4)
-        return -EIO;
-    uint32_t status;
-    memcpy(&status, resp.data(), 4);
-    if (status != 0)
-        return -(int)status;
+    if (status != 0) return -status;
     return 0;
 }
-
-
-
-
 
 static int do_unlink(const char *path)
 {
     string p(path);
-    uint32_t op_be = htonl(OP_UNLINK);
     uint32_t pathlen_be = htonl(static_cast<uint32_t>(p.size()));
 
     vector<char> payload;
-    payload.insert(payload.end(), reinterpret_cast<char *>(&op_be), reinterpret_cast<char *>(&op_be) + 4);
     payload.insert(payload.end(), reinterpret_cast<char *>(&pathlen_be), reinterpret_cast<char *>(&pathlen_be) + 4);
     payload.insert(payload.end(), p.begin(), p.end());
 
     vector<char> resp;
     long latency_us = 0;
     size_t bytes_sent = 0, bytes_recv = 0;
-    if (send_frame_and_recv(payload.data(), (uint32_t)payload.size(), resp, latency_us, bytes_sent, bytes_recv) != 0)
-        return -EIO;
+    int status = send_frame_and_recv(OP_UNLINK, payload.data(), (uint32_t)payload.size(), resp, latency_us, bytes_sent, bytes_recv);
 
     metrics.log(opcode_to_string(OP_UNLINK), latency_us, bytes_sent, bytes_recv, "none");
+    
+    if (status == 0)
+    {
+        // On successful unlink, invalidate all cache entries for this path
+        cache_invalidate_path(p);
+    }
 
-    if (resp.size() < 4)
-        return -EIO;
-    uint32_t status;
-    memcpy(&status, resp.data(), 4);
-    if (status != 0)
-        return -(int)status;
-
-    cache_invalidate_path(p);
-    return 0;
+    return -status;
 }
-
-
-
 
 static int do_mkdir(const char *path, mode_t mode)
 {
     string p(path);
-    uint32_t op_be = htonl(OP_MKDIR);
     uint32_t pathlen_be = htonl(static_cast<uint32_t>(p.size()));
     uint32_t mode_be = htonl(static_cast<uint32_t>(mode));
 
     vector<char> payload;
-    payload.insert(payload.end(), reinterpret_cast<char *>(&op_be), reinterpret_cast<char *>(&op_be) + 4);
     payload.insert(payload.end(), reinterpret_cast<char *>(&pathlen_be), reinterpret_cast<char *>(&pathlen_be) + 4);
     payload.insert(payload.end(), p.begin(), p.end());
     payload.insert(payload.end(), reinterpret_cast<char *>(&mode_be), reinterpret_cast<char *>(&mode_be) + 4);
@@ -977,61 +802,39 @@ static int do_mkdir(const char *path, mode_t mode)
     vector<char> resp;
     long latency_us = 0;
     size_t bytes_sent = 0, bytes_recv = 0;
-    if (send_frame_and_recv(payload.data(), (uint32_t)payload.size(), resp, latency_us, bytes_sent, bytes_recv) != 0)
-        return -EIO;
+    int status = send_frame_and_recv(OP_MKDIR, payload.data(), (uint32_t)payload.size(), resp, latency_us, bytes_sent, bytes_recv);
 
     metrics.log(opcode_to_string(OP_MKDIR), latency_us, bytes_sent, bytes_recv, "none");
 
-    if (resp.size() < 4)
-        return -EIO;
-    uint32_t status;
-    memcpy(&status, resp.data(), 4);
-    if (status != 0)
-        return -(int)status;
-    return 0;
+    return -status;
 }
 
 static int do_rmdir(const char *path)
 {
     string p(path);
-    uint32_t op_be = htonl(OP_RMDIR);
     uint32_t pathlen_be = htonl(static_cast<uint32_t>(p.size()));
 
     vector<char> payload;
-    payload.insert(payload.end(), reinterpret_cast<char *>(&op_be), reinterpret_cast<char *>(&op_be) + 4);
     payload.insert(payload.end(), reinterpret_cast<char *>(&pathlen_be), reinterpret_cast<char *>(&pathlen_be) + 4);
     payload.insert(payload.end(), p.begin(), p.end());
 
     vector<char> resp;
     long latency_us = 0;
     size_t bytes_sent = 0, bytes_recv = 0;
-    if (send_frame_and_recv(payload.data(), (uint32_t)payload.size(), resp, latency_us, bytes_sent, bytes_recv) != 0)
-        return -EIO;
+    int status = send_frame_and_recv(OP_RMDIR, payload.data(), (uint32_t)payload.size(), resp, latency_us, bytes_sent, bytes_recv);
 
     metrics.log(opcode_to_string(OP_RMDIR), latency_us, bytes_sent, bytes_recv, "none");
 
-    if (resp.size() < 4)
-        return -EIO;
-    uint32_t status;
-    memcpy(&status, resp.data(), 4);
-    if (status != 0)
-        return -(int)status;
-    return 0;
+    return -status;
 }
-
-
-
-
 
 static int do_truncate(const char *path, off_t size)
 {
     string p(path);
-    uint32_t op_be = htonl(OP_TRUNCATE);
     uint32_t pathlen_be = htonl(static_cast<uint32_t>(p.size()));
     uint64_t size_be = htobe64((uint64_t)size);
 
     vector<char> payload;
-    payload.insert(payload.end(), reinterpret_cast<char *>(&op_be), reinterpret_cast<char *>(&op_be) + 4);
     payload.insert(payload.end(), reinterpret_cast<char *>(&pathlen_be), reinterpret_cast<char *>(&pathlen_be) + 4);
     payload.insert(payload.end(), p.begin(), p.end());
     payload.insert(payload.end(), reinterpret_cast<char *>(&size_be), reinterpret_cast<char *>(&size_be) + 8);
@@ -1039,26 +842,22 @@ static int do_truncate(const char *path, off_t size)
     vector<char> resp;
     long latency_us = 0;
     size_t bytes_sent = 0, bytes_recv = 0;
-    if (send_frame_and_recv(payload.data(), (uint32_t)payload.size(), resp, latency_us, bytes_sent, bytes_recv) != 0)
-        return -EIO;
+    int status = send_frame_and_recv(OP_TRUNCATE, payload.data(), (uint32_t)payload.size(), resp, latency_us, bytes_sent, bytes_recv);
 
     metrics.log(opcode_to_string(OP_TRUNCATE), latency_us, bytes_sent, bytes_recv, "none");
 
-    if (resp.size() < 4)
-        return -EIO;
-    uint32_t status;
-    memcpy(&status, resp.data(), 4);
-    if (status != 0)
-        return -(int)status;
-
-    cache_invalidate_path(p);
-    return 0;
+    if (status == 0)
+    {
+        // Truncate invalidates all cache entries for this path
+        cache_invalidate_path(p);
+    }
+    
+    return -status;
 }
 
 static int do_utimens(const char *path, const struct timespec tv[2])
 {
     string p(path);
-    uint32_t op_be = htonl(OP_UTIMENS);
     uint32_t pathlen_be = htonl(static_cast<uint32_t>(p.size()));
     uint64_t at_sec = htobe64((uint64_t)tv[0].tv_sec);
     uint64_t at_nsec = htobe64((uint64_t)tv[0].tv_nsec);
@@ -1066,7 +865,6 @@ static int do_utimens(const char *path, const struct timespec tv[2])
     uint64_t mt_nsec = htobe64((uint64_t)tv[1].tv_nsec);
 
     vector<char> payload;
-    payload.insert(payload.end(), reinterpret_cast<char *>(&op_be), reinterpret_cast<char *>(&op_be) + 4);
     payload.insert(payload.end(), reinterpret_cast<char *>(&pathlen_be), reinterpret_cast<char *>(&pathlen_be) + 4);
     payload.insert(payload.end(), p.begin(), p.end());
     payload.insert(payload.end(), reinterpret_cast<char *>(&at_sec), reinterpret_cast<char *>(&at_sec) + 8);
@@ -1077,56 +875,67 @@ static int do_utimens(const char *path, const struct timespec tv[2])
     vector<char> resp;
     long latency_us = 0;
     size_t bytes_sent = 0, bytes_recv = 0;
-    if (send_frame_and_recv(payload.data(), (uint32_t)payload.size(), resp, latency_us, bytes_sent, bytes_recv) != 0)
-        return -EIO;
+    int status = send_frame_and_recv(OP_UTIMENS, payload.data(), (uint32_t)payload.size(), resp, latency_us, bytes_sent, bytes_recv);
 
     metrics.log(opcode_to_string(OP_UTIMENS), latency_us, bytes_sent, bytes_recv, "none");
 
-    if (resp.size() < 4)
-        return -EIO;
-    uint32_t status;
-    memcpy(&status, resp.data(), 4);
-    if (status != 0)
-        return -(int)status;
+    return -status;
+}
+
+static int do_statfs(const char *path, struct statvfs *stbuf)
+{
+    string p(path);
+    uint32_t pathlen_be = htonl(static_cast<uint32_t>(p.size()));
+
+    vector<char> payload;
+    payload.insert(payload.end(), reinterpret_cast<char *>(&pathlen_be), reinterpret_cast<char *>(&pathlen_be) + 4);
+    payload.insert(payload.end(), p.begin(), p.end());
+
+    vector<char> resp;
+    long latency_us = 0;
+    size_t bytes_sent = 0, bytes_recv = 0;
+    int status = send_frame_and_recv(OP_STATFS, payload.data(), (uint32_t)payload.size(), resp, latency_us, bytes_sent, bytes_recv);
+
+    metrics.log(opcode_to_string(OP_STATFS), latency_us, bytes_sent, bytes_recv, "none");
+
+    if (status != 0) return -status;
+    
+    if (resp.size() < 4 + sizeof(struct statvfs)) return -EIO;
+        
+    memcpy(stbuf, resp.data() + 4, sizeof(struct statvfs));
     return 0;
 }
 
-
-
-
-
-
-
-
-
-
-
-
 // ------------------------------ FUSE callbacks ------------------------------
+// These are the functions FUSE calls for filesystem operations.
+
 static int nf_getattr(const char *path, struct stat *stbuf, struct fuse_file_info *)
 {
+    cout << "FUSE: getattr(path=" << path << ")" << endl;
     return do_getattr(path, stbuf);
 }
 
 static int nf_readdir(const char *path, void *buf, fuse_fill_dir_t filler, off_t, struct fuse_file_info *, fuse_readdir_flags)
 {
+    cout << "FUSE: readdir(path=" << path << ")" << endl;
     return do_readdir(path, buf, filler);
 }
 
 static int nf_open(const char *path, struct fuse_file_info *fi)
 {
+    cout << "FUSE: open(path=" << path << ", flags=" << fi->flags << ")" << endl;
     uint64_t serverfd = 0;
-    fi->direct_io = 1;
-    int flags = fi->flags;
-    int r = do_open_or_create(path, flags, 0644, false, serverfd);
+    fi->direct_io = 1; // Tell FUSE we don't want its page caching
+    int r = do_open_or_create(path, fi->flags, 0644, false, serverfd);
     if (r < 0)
         return r;
-    fi->fh = serverfd;
+    fi->fh = serverfd; // Store server's FD in the file handle
     return 0;
 }
 
 static int nf_create(const char *path, mode_t mode, struct fuse_file_info *fi)
 {
+    cout << "FUSE: create(path=" << path << ", mode=" << mode << ", flags=" << fi->flags << ")" << endl;
     uint64_t serverfd = 0;
     fi->direct_io = 1;
     int r = do_open_or_create(path, fi->flags, mode, true, serverfd);
@@ -1136,10 +945,11 @@ static int nf_create(const char *path, mode_t mode, struct fuse_file_info *fi)
     return 0;
 }
 
+// Serve reads from block cache when possible. For missing blocks, fetch from server.
 static int nf_read(const char *path, char *buf, size_t size, off_t offset, struct fuse_file_info *fi)
 {
-    if (size == 0)
-        return 0;
+    cout << "FUSE: read(path=" << path << ", size=" << size << ", offset=" << offset << ")" << endl;
+    if (size == 0) return 0;
 
     string spath(path);
     uint64_t serverfd = (uint64_t)fi->fh;
@@ -1150,71 +960,148 @@ static int nf_read(const char *path, char *buf, size_t size, off_t offset, struc
 
     for (uint64_t b = first_block; b <= last_block; ++b)
     {
-        off_t block_offset = b * CACHE_BLOCK_SIZE;
+        off_t block_start_offset = b * CACHE_BLOCK_SIZE;
+        // Calculate where our *requested* data starts within this block
         size_t within_block_offset = (b == first_block) ? (offset % CACHE_BLOCK_SIZE) : 0;
-        size_t want = min(CACHE_BLOCK_SIZE - within_block_offset, size - bytes_filled);
+        // Calculate how many bytes we *want* from this block
+        size_t want_from_this_block = min(CACHE_BLOCK_SIZE - within_block_offset, size - bytes_filled);
 
         string key = make_block_key(spath, b);
 
-        char tmpblock[CACHE_BLOCK_SIZE] = {0};
+        char tmpblock[CACHE_BLOCK_SIZE];
         size_t got_block_len = 0;
 
+        // ---- Try cache first ----
         bool in_cache = cache_get_block(key, tmpblock, got_block_len);
 
         if (in_cache)
         {
-            metrics.log(opcode_to_string(OP_READ), 0, 0, got_block_len, "hit");
+            // Cache Hit
+            cout << "  [Cache hit] key=" << key << " len=" << got_block_len << endl;
+            // Log a 0-latency "hit" event
+            metrics.log(opcode_to_string(OP_READ), 0, 0, 0, "hit");
         }
         else
         {
+            // Cache Miss
+            cout << "  [Cache miss] key=" << key << " -> fetching block from server..." << endl;
+
+            // We must read the *entire* block from the server to cache it
             vector<char> rbuf(CACHE_BLOCK_SIZE);
             size_t server_got = 0;
 
-            int rr = do_read(serverfd, rbuf.data(), CACHE_BLOCK_SIZE, block_offset, &server_got);
-            if (rr < 0)
-            {
-                return rr;
-            }
+            int rr = do_read(serverfd, rbuf.data(), CACHE_BLOCK_SIZE, block_start_offset, &server_got);
+            if (rr < 0) return rr;
+            if (server_got == 0) break; // EOF
 
+            // Store the (potentially partial) block in cache
             cache_put_block(key, rbuf.data(), server_got);
+
             memcpy(tmpblock, rbuf.data(), server_got);
             got_block_len = server_got;
         }
 
+        // ---- Copy requested range from block into user buffer ----
+        
+        // Check how many bytes are *actually available* to copy from this block
         size_t avail_in_block = (got_block_len > within_block_offset)
                                     ? (got_block_len - within_block_offset)
                                     : 0;
 
-        size_t to_copy = min(avail_in_block, want);
+        size_t to_copy = min(avail_in_block, want_from_this_block);
         if (to_copy > 0)
         {
             memcpy(buf + bytes_filled, tmpblock + within_block_offset, to_copy);
             bytes_filled += to_copy;
         }
 
-        if (got_block_len < within_block_offset + want)
+        // If we copied less than we wanted, we hit EOF (or a short read)
+        if (to_copy < want_from_this_block)
             break;
     }
 
+    cout << "  Total bytes read: " << bytes_filled << endl;
     return static_cast<int>(bytes_filled);
 }
 
+
+// Implements write-behind batching
 static int nf_write(const char *path, const char *buf, size_t size, off_t offset, struct fuse_file_info *fi)
 {
-    size_t wrote = 0;
+    cout << "FUSE: write(path=" << path << ", size=" << size << ", offset=" << offset << ")" << endl;
     uint64_t serverfd = (uint64_t)fi->fh;
+    int r = 0;
 
-    int r = do_write_async(serverfd, buf, size, offset, &wrote);
-    if (r < 0)
-        return r;
+    lock_guard<mutex> lk(g_write_buffer_mtx);
+    
+    auto it = g_write_buffers.find(serverfd);
+    bool sequential = false;
+    
+    if (it != g_write_buffers.end())
+    {
+        // Buffer exists, check if this write is sequential
+        off_t next_expected_offset = g_write_buffer_start_offsets[serverfd] + it->second.size();
+        if (offset == next_expected_offset)
+        {
+            sequential = true;
+        }
+    }
+    else
+    {
+        // No buffer exists, this is the start of a new batch
+        sequential = true;
+        g_write_buffers[serverfd] = "";
+        g_write_buffer_start_offsets[serverfd] = offset;
+    }
 
-    return (int)wrote;
+    if (!sequential)
+    {
+        cout << "  Non-sequential write detected. Flushing buffer first." << endl;
+        // This is a seek. Flush the old buffer before starting a new one.
+        // We pass lock=false because we already hold the mutex.
+        r = flush_write_buffer(serverfd, false); 
+        
+        // Start new buffer
+        g_write_buffers[serverfd] = "";
+        g_write_buffer_start_offsets[serverfd] = offset;
+    }
+    
+    if (r < 0) return r; // Error during flush
+
+    // Append new data to the batch
+    g_write_buffers[serverfd].append(buf, size);
+    
+    // Check if buffer is full
+    if (g_write_buffers[serverfd].size() >= BATCH_WRITE_THRESHOLD)
+    {
+        cout << "  Write buffer threshold reached. Flushing." << endl;
+        r = flush_write_buffer(serverfd, false);
+    }
+    
+    // We *always* return success (size) because the write is buffered.
+    // Errors will be reported on fsync, release, or the *next* write.
+    return (r < 0) ? r : (int)size;
+}
+
+static int nf_fsync(const char *path, int, struct fuse_file_info *fi)
+{
+    cout << "FUSE: fsync(path=" << path << ")" << endl;
+    uint64_t serverfd = (uint64_t)fi->fh;
+    
+    // fsync *must* flush the write buffer
+    return flush_write_buffer(serverfd);
 }
 
 static int nf_release(const char *path, struct fuse_file_info *fi)
 {
+    cout << "FUSE: release(path=" << path << ")" << endl;
     uint64_t serverfd = (uint64_t)fi->fh;
-
+    
+    // --- 1. Flush any pending writes ---
+    // This is critical. We must write all buffered data before closing.
+    int flush_err = flush_write_buffer(serverfd);
+    
+    // --- 2. Invalidate read cache ---
     string spath;
     {
         lock_guard<mutex> lk(fdpath_mtx);
@@ -1222,53 +1109,62 @@ static int nf_release(const char *path, struct fuse_file_info *fi)
         if (it != fd_to_path.end())
         {
             spath = it->second;
-            fd_to_path.erase(it);
+            fd_to_path.erase(it); // Clean up fd->path map
         }
     }
     if (!spath.empty())
-        cache_invalidate_path(spath);
+        cache_invalidate_path(spath); // Invalidate all read blocks for this path
 
-    if (g_batch_manager)
-        g_batch_manager->flush_sfd(serverfd);
-
-    return do_release(serverfd);
+    // --- 3. Tell server to release the FD ---
+    int release_err = do_release(serverfd);
+    
+    // Prioritize returning the flush error if one occurred
+    return (flush_err < 0) ? flush_err : release_err;
 }
 
-static int nf_unlink(const char *path) { return do_unlink(path); }
-static int nf_mkdir(const char *path, mode_t mode) { return do_mkdir(path, mode); }
-static int nf_rmdir(const char *path) { return do_rmdir(path); }
-static int nf_truncate(const char *path, off_t size, struct fuse_file_info *) { return do_truncate(path, size); }
-static int nf_utimens(const char *path, const struct timespec tv[2], struct fuse_file_info *) { return do_utimens(path, tv); }
-static int nf_statfs(const char *path, struct statvfs *stbuf) { return do_statfs(path, stbuf); }
+static int nf_unlink(const char *path) 
+{ 
+    cout << "FUSE: unlink(path=" << path << ")" << endl;
+    return do_unlink(path); 
+}
+static int nf_mkdir(const char *path, mode_t mode) 
+{ 
+    cout << "FUSE: mkdir(path=" << path << ")" << endl;
+    return do_mkdir(path, mode); 
+}
+static int nf_rmdir(const char *path) 
+{ 
+    cout << "FUSE: rmdir(path=" << path << ")" << endl;
+    return do_rmdir(path); 
+}
+static int nf_truncate(const char *path, off_t size, struct fuse_file_info *) 
+{ 
+    cout << "FUSE: truncate(path=" << path << ", size=" << size << ")" << endl;
+    
+    // We must flush any writes to this file *before* truncating
+    // This is complex as we only have the path, not the fd.
+    // A simple solution is to just invalidate the cache.
+    // A full solution would require tracking open fds by path.
+    // For now, we just invalidate the cache and send the truncate.
+    cache_invalidate_path(path); 
+    
+    return do_truncate(path, size); 
+}
+static int nf_utimens(const char *path, const struct timespec tv[2], struct fuse_file_info *) 
+{ 
+    cout << "FUSE: utimens(path=" << path << ")" << endl;
+    return do_utimens(path, tv); 
+}
+static int nf_statfs(const char *path, struct statvfs *stbuf) 
+{ 
+    cout << "FUSE: statfs(path=" << path << ")" << endl;
+    return do_statfs(path, stbuf); 
+}
 
 static struct fuse_operations nf_ops;
 
-int main(int argc, char **argv)
+void set_fuse_ops()
 {
-    if (argc < 4)
-    {
-        fprintf(stderr, "Usage: %s <mountpoint> <server-host> <server-port> [fuse-args...]", argv[0]);
-        return 1;
-    }
-
-    const char *mountpoint = argv[1];
-    const char *host = argv[2];
-    const char *port = argv[3];
-
-    sockfd = connect_to_server(host, port);
-    if (sockfd < 0)
-        die("connect_to_server");
-
-    g_batch_manager = new WriteBatchManager();
-
-    vector<char *> fargs;
-    fargs.push_back(argv[0]);
-    fargs.push_back(const_cast<char *>(mountpoint));
-    for (int i = 4; i < argc; ++i)
-        fargs.push_back(argv[i]);
-    int fargc = (int)fargs.size();
-    fargs.push_back(nullptr);
-
     memset(&nf_ops, 0, sizeof(nf_ops));
     nf_ops.getattr = nf_getattr;
     nf_ops.readdir = nf_readdir;
@@ -1283,14 +1179,42 @@ int main(int argc, char **argv)
     nf_ops.truncate = nf_truncate;
     nf_ops.utimens = nf_utimens;
     nf_ops.statfs = nf_statfs;
+    nf_ops.fsync = nf_fsync; // Register fsync
+}
 
-    int ret = fuse_main(fargc, fargs.data(), &nf_ops, nullptr);
-
-    if (g_batch_manager)
+int main(int argc, char **argv)
+{
+    if (argc < 4)
     {
-        delete g_batch_manager;
-        g_batch_manager = nullptr;
+        fprintf(stderr, "Usage: %s <mountpoint> <server-host> <server-port> [fuse-args...]\n", argv[0]);
+        return 1;
     }
+
+    const char *mountpoint = argv[1];
+    const char *host = argv[2];
+    const char *port = argv[3];
+
+    sockfd = connect_to_server(host, port);
+    if (sockfd < 0)
+        die("connect_to_server");
+    
+    printf("Connected to server at %s:%s\n", host, port);
+
+    // Prepare FUSE arguments
+    vector<char *> fargs;
+    fargs.push_back(argv[0]); // Program name
+    // Add any FUSE-specific args *before* the mountpoint
+    for (int i = 4; i < argc; ++i)
+        fargs.push_back(argv[i]);
+    fargs.push_back(const_cast<char *>(mountpoint)); // Mountpoint
+    
+    int fargc = (int)fargs.size();
+
+    // Set up the operations table
+    set_fuse_ops();
+
+    // Start the FUSE main loop
+    int ret = fuse_main(fargc, fargs.data(), &nf_ops, nullptr);
 
     if (sockfd >= 0)
     {
