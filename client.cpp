@@ -29,6 +29,7 @@
 #include <sstream>
 #include <iostream>
 #include <algorithm>
+#include <condition_variable> // NEW: For the connection pool
 
 using namespace std;
 
@@ -76,6 +77,96 @@ static string opcode_to_string(uint32_t op)
     }
 }
 
+
+
+
+// ----------------------------- Helper that prints errno and exits
+static void die(const char *m)
+{
+    perror(m);
+    exit(1);
+}
+
+// --------------------------- Networking helpers ---------------------------
+static int connect_to_server(const char *host, const char *port)
+{
+    struct addrinfo hints{};
+    struct addrinfo *res = nullptr;
+
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+
+    if (getaddrinfo(host, port, &hints, &res) != 0)
+    {
+        die("getaddrinfo");
+    }
+
+    int s = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
+    if (s < 0)
+    {
+        freeaddrinfo(res);
+        die("socket");
+    }
+
+    if (connect(s, res->ai_addr, res->ai_addrlen) < 0)
+    {
+        freeaddrinfo(res);
+        close(s);
+        die("connect");
+    }
+
+    freeaddrinfo(res);
+    return s;
+}
+
+// Reads exactly n bytes from fd into buf
+static int readn(int fd, void *buf, size_t n)
+{
+    size_t left = n;
+    char *p = static_cast<char *>(buf);
+
+    while (left)
+    {
+        ssize_t r = ::read(fd, p, left);
+        if (r < 0)
+        {
+            if (errno == EINTR)
+                continue;
+            return -1; // Error
+        }
+        if (r == 0)
+            return 0; // EOF
+        left -= r;
+        p += r;
+    }
+    return (int)n;
+}
+
+// Writes exactly n bytes from buf to fd
+static int writen(int fd, const void *buf, size_t n)
+{
+    size_t left = n;
+    const char *p = static_cast<const char *>(buf);
+
+    while (left)
+    {
+        ssize_t w = ::write(fd, p, left);
+        if (w < 0)
+        {
+            if (errno == EINTR)
+                continue;
+            return -1; // Error
+        }
+        if (w == 0)
+            return 0; // Should not happen for sockets
+        left -= w;
+        p += w;
+    }
+    return (int)n;
+}
+
+
+
 // ------------------------------ Metrics logger ----------------------------
 // Writes CSV lines: timestamp_us,opcode,latency_us,bytes_sent,bytes_recv,cache
 class MetricLogger
@@ -119,13 +210,23 @@ public:
 static MetricLogger metrics; // Global metrics logger instance
 
 // --------------------------- Global socket state ---------------------------
-static int sockfd = -1;
-static mutex sock_mtx; // Mutex to protect all read/write access to sockfd
+// REMOVED:
+// static int sockfd = -1;
+// static mutex sock_mtx; // Mutex to protect all read/write access to sockfd
+
+// NEW: Connection pool state
+static std::vector<int> g_socket_pool;
+static std::mutex g_socket_pool_mtx;
+static std::condition_variable g_socket_pool_cv;
+static const int POOL_SIZE = 16; // 16 concurrent network connections
+static const char *g_server_host = nullptr; // For reconnects
+static const char *g_server_port = nullptr; // For reconnects
+
 
 // ---------------------------- Caching parameters ---------------------------
 static const size_t CACHE_BLOCK_SIZE = 4096;                 // 4KB blocks
 static const size_t CACHE_CAPACITY_BYTES = 16 * 1024 * 1024; // 16 MB total cache
-static const chrono::seconds CACHE_TIMEOUT(100);              // 10-second cache timeout
+static const chrono::seconds CACHE_TIMEOUT(10);              // 10-second cache timeout
 
 // ------------------------------- Cache types ------------------------------
 // Value stored in the read cache
@@ -147,6 +248,17 @@ static size_t cache_size_bytes = 0; // Current total size of data in cache
 // Map serverfd -> path so we can invalidate by fd on release
 static mutex fdpath_mtx;
 static unordered_map<uint64_t, string> fd_to_path;
+
+// --------------------------- Attribute Cache -----------------------------
+// NEW: Add a cache for file attributes (struct stat)
+struct AttrCacheValue
+{
+    struct stat stbuf;
+    chrono::steady_clock::time_point timestamp;
+};
+static mutex attr_cache_mtx;
+static unordered_map<string, AttrCacheValue> attr_cache;
+
 
 // Evicts least-recently-used items until cache is under capacity
 static void cache_evict_if_needed()
@@ -279,6 +391,13 @@ static string make_block_key(const string &path, uint64_t block_idx)
     return path + ":" + to_string(block_idx);
 }
 
+// NEW: Invalidate attribute cache for a path
+static void attr_cache_invalidate(const string &path)
+{
+    lock_guard<mutex> lk(attr_cache_mtx);
+    attr_cache.erase(path);
+}
+
 // --------------------------- Write Batching State --------------------------
 static const size_t BATCH_WRITE_THRESHOLD = 1 * 1024 * 1024; // 1 MB
 static mutex g_write_buffer_mtx;
@@ -293,146 +412,122 @@ static int do_batch_write(uint64_t serverfd, const char *buf, size_t size, off_t
 // This function MUST be called with g_write_buffer_mtx *unlocked* or with lock=false if already locked.
 static int flush_write_buffer(uint64_t serverfd, bool lock = true)
 {
-    string buffer;
-    off_t start_offset = 0;
-    
-    // Scope for the lock
-    {
-        unique_lock<mutex> lk(g_write_buffer_mtx, defer_lock);
-        if (lock) lk.lock();
-
-        auto it = g_write_buffers.find(serverfd);
-        if (it == g_write_buffers.end() || it->second.empty())
-        {
-            return 0; // Nothing to flush
-        }
-        
-        // Move the buffer out of the map atomically
-        buffer = std::move(it->second);
-        start_offset = g_write_buffer_start_offsets[serverfd];
-        
-        // Clear the map entries
-        g_write_buffers.erase(it);
-        g_write_buffer_start_offsets.erase(serverfd);
+    // This unique_lock will be conditionally acquired
+    std::unique_lock<mutex> lk(g_write_buffer_mtx, std::defer_lock);
+    if (lock) {
+        lk.lock();
     }
-    
-    cout << "Flushing write buffer for fd=" << serverfd 
-         << ", size=" << buffer.size() 
-         << ", offset=" << start_offset << endl;
-         
-    size_t wrote = 0;
-    int r = do_batch_write(serverfd, buffer.data(), buffer.size(), start_offset, &wrote);
-    
-    if (r < 0) return r;
-    if (wrote != buffer.size()) return -EIO; // Short write on flush is an error
 
-    // Invalidate read cache for the blocks we just wrote
+    auto it = g_write_buffers.find(serverfd);
+    if (it == g_write_buffers.end() || it->second.empty())
+    {
+        return 0; // Nothing to flush
+    }
+
+    cout << "  Flushing write buffer for fd=" << serverfd 
+         << " (size=" << it->second.size() 
+         << ", offset=" << g_write_buffer_start_offsets[serverfd] << ")" << endl;
+
+    // --- Invalidate caches *before* writing ---
+    // This ensures read-your-writes consistency.
     string spath;
     {
-        lock_guard<mutex> lk(fdpath_mtx);
-        auto it = fd_to_path.find(serverfd);
-        if (it != fd_to_path.end())
-            spath = it->second;
+        lock_guard<mutex> lk_fd(fdpath_mtx);
+        auto it_path = fd_to_path.find(serverfd);
+        if (it_path != fd_to_path.end())
+            spath = it_path->second;
     }
+
     if (!spath.empty())
     {
+        off_t start_offset = g_write_buffer_start_offsets[serverfd];
+        off_t end_offset = start_offset + it->second.size();
         uint64_t first_block = (uint64_t)start_offset / CACHE_BLOCK_SIZE;
-        uint64_t last_block = (uint64_t)(start_offset + wrote - 1) / CACHE_BLOCK_SIZE;
+        uint64_t last_block = (uint64_t)(end_offset - 1) / CACHE_BLOCK_SIZE;
+
         for (uint64_t b = first_block; b <= last_block; ++b)
         {
             string key = make_block_key(spath, b);
             cache_erase_key(key);
         }
+        // A successful write also changes file attributes (size, mtime)
+        attr_cache_invalidate(spath);
     }
     
-    return 0;
+    // --- Send data to server ---
+    size_t wrote = 0;
+    int r = do_batch_write(serverfd, 
+                         it->second.data(), 
+                         it->second.size(), 
+                         g_write_buffer_start_offsets[serverfd], 
+                         &wrote);
+
+    // --- Clear buffer ---
+    it->second.clear();
+    g_write_buffer_start_offsets.erase(serverfd);
+    g_write_buffers.erase(it);
+
+    return (r < 0) ? r : 0;
 }
 
-
-// ----------------------------- Helper that prints errno and exits
-static void die(const char *m)
+// NEW: Gets a socket from the pool, waiting if none are available
+static int get_socket()
 {
-    perror(m);
-    exit(1);
-}
+    std::unique_lock<std::mutex> lk(g_socket_pool_mtx);
+    // Wait until the pool is not empty
+    g_socket_pool_cv.wait(lk, []{ return !g_socket_pool.empty(); });
 
-// --------------------------- Networking helpers ---------------------------
-static int connect_to_server(const char *host, const char *port)
-{
-    struct addrinfo hints{};
-    struct addrinfo *res = nullptr;
-
-    hints.ai_family = AF_UNSPEC;
-    hints.ai_socktype = SOCK_STREAM;
-
-    if (getaddrinfo(host, port, &hints, &res) != 0)
-    {
-        die("getaddrinfo");
-    }
-
-    int s = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
-    if (s < 0)
-    {
-        freeaddrinfo(res);
-        die("socket");
-    }
-
-    if (connect(s, res->ai_addr, res->ai_addrlen) < 0)
-    {
-        freeaddrinfo(res);
-        close(s);
-        die("connect");
-    }
-
-    freeaddrinfo(res);
+    int s = g_socket_pool.back();
+    g_socket_pool.pop_back();
     return s;
 }
 
-// Reads exactly n bytes from fd into buf
-static int readn(int fd, void *buf, size_t n)
+// NEW: Returns a socket to the pool and notifies a waiting thread
+static void release_socket(int s)
 {
-    size_t left = n;
-    char *p = static_cast<char *>(buf);
-
-    while (left)
-    {
-        ssize_t r = ::read(fd, p, left);
-        if (r < 0)
-        {
-            if (errno == EINTR)
-                continue;
-            return -1; // Error
-        }
-        if (r == 0)
-            return 0; // EOF
-        left -= r;
-        p += r;
-    }
-    return (int)n;
+    std::lock_guard<std::mutex> lk(g_socket_pool_mtx);
+    g_socket_pool.push_back(s);
+    g_socket_pool_cv.notify_one(); // Wake up one waiting thread
 }
 
-// Writes exactly n bytes from buf to fd
-static int writen(int fd, const void *buf, size_t n)
+// NEW: RAII helper to manage socket checkout/check-in
+// This also handles socket errors by closing the bad socket
+// and replacing it with a new one.
+class SocketGuard
 {
-    size_t left = n;
-    const char *p = static_cast<const char *>(buf);
+    int s_ = -1;
+    bool had_error_ = false;
 
-    while (left)
-    {
-        ssize_t w = ::write(fd, p, left);
-        if (w < 0)
-        {
-            if (errno == EINTR)
-                continue;
-            return -1; // Error
-        }
-        if (w == 0)
-            return 0; // Should not happen for sockets
-        left -= w;
-        p += w;
+public:
+    SocketGuard() {
+        s_ = get_socket();
     }
-    return (int)n;
-}
+
+    ~SocketGuard() {
+        if (s_ < 0) return; // No socket was acquired
+
+        if (had_error_) {
+            // Socket is bad, close it
+            cout << "Socket error detected. Closing and reconnecting." << endl;
+            ::close(s_);
+            // Try to add a new connection to the pool to replace it
+            int new_s = connect_to_server(g_server_host, g_server_port);
+            if (new_s >= 0) {
+                release_socket(new_s);
+            } else {
+                cerr << "Failed to reconnect to server to replace bad socket." << endl;
+                // Pool size will shrink, which is acceptable.
+            }
+        } else {
+            // Socket is good, return it to the pool
+            release_socket(s_);
+        }
+    }
+
+    int get() { return s_; }
+    void invalidate() { had_error_ = true; }
+};
+
 
 // Core network protocol function.
 // Sends a 4-byte BE length + payload.
@@ -446,32 +541,47 @@ static int send_frame_and_recv(uint32_t opcode, const void *payload, uint32_t pa
     using namespace chrono;
     auto start = high_resolution_clock::now();
 
-    unique_lock<mutex> lk(sock_mtx); // Lock the socket for this entire transaction
+    // MODIFIED: Use the SocketGuard to get a socket from the pool
+    SocketGuard sock_guard;
+    int s = sock_guard.get();
+    if (s < 0) return -EIO; // Should not happen if pool is managed
+
+    // REMOVED: unique_lock<mutex> lk(sock_mtx);
 
     // --- Send request ---
     // 4-byte length prefix (opcode + payload)
     uint32_t total_len = 4 + payload_len;
     uint32_t len_be = htonl(total_len);
-    if (writen(sockfd, &len_be, sizeof(len_be)) != (int)sizeof(len_be))
+    if (writen(s, &len_be, sizeof(len_be)) != (int)sizeof(len_be)) {
+        sock_guard.invalidate(); // Mark socket as bad
         return -EIO;
+    }
     
     // 4-byte opcode
     uint32_t op_be = htonl(opcode);
-    if (writen(sockfd, &op_be, sizeof(op_be)) != (int)sizeof(op_be))
+    if (writen(s, &op_be, sizeof(op_be)) != (int)sizeof(op_be)) {
+        sock_guard.invalidate();
         return -EIO;
+    }
 
     // Payload
-    if (payload_len > 0 && writen(sockfd, payload, payload_len) != (int)payload_len)
+    if (payload_len > 0 && writen(s, payload, payload_len) != (int)payload_len) {
+        sock_guard.invalidate();
         return -EIO;
+    }
 
     // --- Receive response ---
     uint32_t status_be, dlen_be;
     // 4-byte status
-    if (readn(sockfd, &status_be, sizeof(status_be)) != (int)sizeof(status_be))
+    if (readn(s, &status_be, sizeof(status_be)) != (int)sizeof(status_be)) {
+        sock_guard.invalidate();
         return -EIO;
+    }
     // 4-byte data length
-    if (readn(sockfd, &dlen_be, sizeof(dlen_be)) != (int)sizeof(dlen_be))
+    if (readn(s, &dlen_be, sizeof(dlen_be)) != (int)sizeof(dlen_be)) {
+        sock_guard.invalidate();
         return -EIO;
+    }
     
     uint32_t status = ntohl(status_be);
     uint32_t dlen = ntohl(dlen_be);
@@ -481,10 +591,12 @@ static int send_frame_and_recv(uint32_t opcode, const void *payload, uint32_t pa
     memcpy(out_resp_data.data(), &status_be, 4); // Copy status in
 
     // Read data payload if present
-    if (dlen && readn(sockfd, out_resp_data.data() + 4, dlen) != (int)dlen)
+    if (dlen && readn(s, out_resp_data.data() + 4, dlen) != (int)dlen) {
+        sock_guard.invalidate();
         return -EIO;
+    }
 
-    lk.unlock(); // Unlock socket
+    // REMOVED: lk.unlock(); // Unlock socket
     
     auto end = high_resolution_clock::now();
     out_latency_us = duration_cast<microseconds>(end - start).count();
@@ -496,6 +608,7 @@ static int send_frame_and_recv(uint32_t opcode, const void *payload, uint32_t pa
     // Return the status code (0 for success, errno otherwise)
     return (int)status;
 }
+
 
 // ------------------------ High level operation helpers ------------------------
 // These helpers format the request payload, call send_frame_and_recv, 
@@ -783,6 +896,8 @@ static int do_unlink(const char *path)
     {
         // On successful unlink, invalidate all cache entries for this path
         cache_invalidate_path(p);
+        // MODIFIED: Also invalidate attributes
+        attr_cache_invalidate(p);
     }
 
     return -status;
@@ -850,6 +965,8 @@ static int do_truncate(const char *path, off_t size)
     {
         // Truncate invalidates all cache entries for this path
         cache_invalidate_path(p);
+        // MODIFIED: Also invalidate attributes
+        attr_cache_invalidate(p);
     }
     
     return -status;
@@ -879,6 +996,12 @@ static int do_utimens(const char *path, const struct timespec tv[2])
 
     metrics.log(opcode_to_string(OP_UTIMENS), latency_us, bytes_sent, bytes_recv, "none");
 
+    // MODIFIED: Invalidate attributes on success
+    if (status == 0)
+    {
+        // Utimens invalidates attributes
+        attr_cache_invalidate(p);
+    }
     return -status;
 }
 
@@ -909,10 +1032,50 @@ static int do_statfs(const char *path, struct statvfs *stbuf)
 // ------------------------------ FUSE callbacks ------------------------------
 // These are the functions FUSE calls for filesystem operations.
 
+// MODIFIED: Replaced with a cached version
 static int nf_getattr(const char *path, struct stat *stbuf, struct fuse_file_info *)
 {
     cout << "FUSE: getattr(path=" << path << ")" << endl;
-    return do_getattr(path, stbuf);
+    string spath(path);
+
+    // --- 1. Try attribute cache first ---
+    {
+        lock_guard<mutex> lk(attr_cache_mtx);
+        auto it = attr_cache.find(spath);
+        if (it != attr_cache.end())
+        {
+            // Check for staleness
+            auto age = chrono::steady_clock::now() - it->second.timestamp;
+            if (age <= CACHE_TIMEOUT)
+            {
+                // Cache hit and not stale
+                cout << "  [Attr cache hit] path=" << path << endl;
+                memcpy(stbuf, &it->second.stbuf, sizeof(struct stat));
+                return 0;
+            }
+            else
+            {
+                // Stale, evict
+                attr_cache.erase(it);
+            }
+        }
+    }
+
+    // --- 2. Cache miss or stale, fetch from server ---
+    cout << "  [Attr cache miss] path=" << path << " -> fetching from server..." << endl;
+    int r = do_getattr(path, stbuf);
+    if (r == 0)
+    {
+        // --- 3. Store in cache on success ---
+        AttrCacheValue acv;
+        memcpy(&acv.stbuf, stbuf, sizeof(struct stat));
+        acv.timestamp = chrono::steady_clock::now();
+        {
+            lock_guard<mutex> lk(attr_cache_mtx);
+            attr_cache[spath] = acv;
+        }
+    }
+    return r;
 }
 
 static int nf_readdir(const char *path, void *buf, fuse_fill_dir_t filler, off_t, struct fuse_file_info *, fuse_readdir_flags)
@@ -1113,7 +1276,11 @@ static int nf_release(const char *path, struct fuse_file_info *fi)
         }
     }
     if (!spath.empty())
+    {
         cache_invalidate_path(spath); // Invalidate all read blocks for this path
+        // MODIFIED: Also invalidate attributes on release
+        attr_cache_invalidate(spath);
+    }
 
     // --- 3. Tell server to release the FD ---
     int release_err = do_release(serverfd);
@@ -1137,17 +1304,37 @@ static int nf_rmdir(const char *path)
     cout << "FUSE: rmdir(path=" << path << ")" << endl;
     return do_rmdir(path); 
 }
+// MODIFIED: Fixed critical bug with write-batching
 static int nf_truncate(const char *path, off_t size, struct fuse_file_info *) 
 { 
     cout << "FUSE: truncate(path=" << path << ", size=" << size << ")" << endl;
+    string spath(path);
+
+    // --- 1. Flush all open write buffers for this path ---
+    // This is critical to prevent stale buffered writes from
+    // overwriting the truncate.
+    vector<uint64_t> fds_to_flush;
+    {
+        lock_guard<mutex> lk(fdpath_mtx);
+        for (auto const& [fd, p] : fd_to_path)
+        {
+            if (p == spath)
+            {
+                fds_to_flush.push_back(fd);
+            }
+        }
+    }
     
-    // We must flush any writes to this file *before* truncating
-    // This is complex as we only have the path, not the fd.
-    // A simple solution is to just invalidate the cache.
-    // A full solution would require tracking open fds by path.
-    // For now, we just invalidate the cache and send the truncate.
-    cache_invalidate_path(path); 
-    
+    cout << "  Truncate: found " << fds_to_flush.size() << " open handles for this path. Flushing..." << endl;
+    for (uint64_t fd : fds_to_flush)
+    {
+        // This will lock g_write_buffer_mtx
+        int r = flush_write_buffer(fd); 
+        if (r < 0) return r; // Report flush error
+    }
+
+    // --- 2. Send truncate op (which also invalidates caches) ---
+    // do_truncate will invalidate both block and attribute caches on success
     return do_truncate(path, size); 
 }
 static int nf_utimens(const char *path, const struct timespec tv[2], struct fuse_file_info *) 
@@ -1194,12 +1381,27 @@ int main(int argc, char **argv)
     const char *host = argv[2];
     const char *port = argv[3];
 
-    sockfd = connect_to_server(host, port);
-    if (sockfd < 0)
-        die("connect_to_server");
-    
-    printf("Connected to server at %s:%s\n", host, port);
+    // MODIFIED: Store host/port and initialize connection pool
+    g_server_host = host;
+    g_server_port = port;
 
+    printf("Connecting to server at %s:%s and filling connection pool (size=%d)...\n", host, port, POOL_SIZE);
+    for (int i = 0; i < POOL_SIZE; ++i)
+    {
+        int s = connect_to_server(host, port);
+        if (s < 0) {
+            die("connect_to_server (during pool init)");
+        }
+        g_socket_pool.push_back(s);
+    }
+    printf("Connection pool filled.\n");
+
+    // REMOVED:
+    // sockfd = connect_to_server(host, port);
+    // if (sockfd < 0)
+    //    die("connect_to_server");
+    // printf("Connected to server at %s:%s\n", host, port);
+    
     // Prepare FUSE arguments
     vector<char *> fargs;
     fargs.push_back(argv[0]); // Program name
@@ -1216,10 +1418,14 @@ int main(int argc, char **argv)
     // Start the FUSE main loop
     int ret = fuse_main(fargc, fargs.data(), &nf_ops, nullptr);
 
-    if (sockfd >= 0)
+    // MODIFIED: Close all sockets in the pool on exit
     {
-        close(sockfd);
-        sockfd = -1;
+        std::lock_guard<std::mutex> lk(g_socket_pool_mtx);
+        for (int s : g_socket_pool) {
+            close(s);
+        }
+        g_socket_pool.clear();
     }
+
     return ret;
 }
