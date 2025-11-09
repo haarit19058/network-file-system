@@ -30,7 +30,8 @@ enum Op : uint32_t
     OP_TRUNCATE = 10,
     OP_UTIMENS = 11,
     OP_STATFS = 12,
-    OP_RELEASE = 13
+    OP_RELEASE = 13,
+    OP_WRITE_BATCH = 14
 };
 
 // -------------------------- Utilities & helpers (kept together) --------------------------

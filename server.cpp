@@ -70,6 +70,10 @@ int handle_one(int client, const string &root)  {
                 if (write_handler(client, root, p)) continue;
                 break;
 
+            case OP_WRITE_BATCH:
+                if (write_handler(client, root, p)) continue;
+                break;
+
             case OP_CREATE:
                 if (open_create_handler(client, root, p, op)) continue;
                 break;
