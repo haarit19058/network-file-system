@@ -29,7 +29,9 @@ rm -f server.log client.log
 # Build both
 echo "🧱 Building server and client..."
 g++ -o server.o server.cpp
-g++ -o client.o -lfuse3 client.cpp
+# g++ -o client.o -lfuse3 client.cpp    # For arch-linux users
+g++ client.cpp -o client.o $(pkg-config fuse3 --cflags --libs)  # For ubuntu users
+
 
 if [ ! -d mntdir ]; then
     mkdir mntdir
