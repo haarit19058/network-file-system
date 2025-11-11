@@ -15,6 +15,8 @@
 
 // Include the handlers and protocol definitions
 #include "utils.cpp"
+#include "threadpool.cpp"
+#define NUM_THREADS 16
 
 using std::string;
 using std::vector;
@@ -162,6 +164,9 @@ int main(int argc, char **argv) {
     
     printf("Server serving root=%s on port %d\n", root.c_str(), port);
 
+    ThreadPool pool(NUM_THREADS); 
+    printf("Initialized Thread Pool with %d worker threads.\n", NUM_THREADS);
+
     while (true) {
         struct sockaddr_in cli;
         socklen_t clilen = sizeof(cli);
@@ -176,11 +181,11 @@ int main(int argc, char **argv) {
 
         // Create a new thread for each client
         // Pass root by value to avoid lifetime issues
-        std::thread([client, root]() {
+        pool.enqueue([client, root]() {
             handle_one(client, root); // handle client requests
             close(client);            // close client socket when done
             cout << "Client disconnected." << endl;
-        }).detach(); // detach so thread cleans up automatically
+        });
     }    
     
     close(listenfd);
