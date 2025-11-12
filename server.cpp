@@ -12,6 +12,7 @@
 #include <arpa/inet.h>
 #include <unistd.h>
 #include <endian.h> // ntohl
+#include <rwlocks.cpp> // For RWLockManager
 
 // Include the handlers and protocol definitions
 #include "utils.cpp"
@@ -24,6 +25,8 @@ using std::cout;
 using std::cerr;
 using std::endl;
 
+RWLockManager g_lock_manager;
+
 /**
  * @brief Handles all requests from a single connected client.
  * * This function runs in a dedicated thread per client. It reads
@@ -35,7 +38,7 @@ using std::endl;
  * @param root The root directory path to serve.
  * @return int 0 on clean disconnect, 1 on error.
  */
-int handle_one(int client, const string &root)  {
+int handle_one(int client, const string &root, RWLockManager &g_lock_manager)  {
     while (true) {
         
         uint32_t len_be;
@@ -73,45 +76,45 @@ int handle_one(int client, const string &root)  {
             switch (op)
             {
             case OP_GETATTR:
-                if (getattr_handler(client, root, p)) continue;
+                if (getattr_handler(client, root, p, g_lock_manager)) continue;
                 break;
             case OP_READDIR:
-                if (readdir_handler(client, root, p)) continue;
+                if (readdir_handler(client, root, p, g_lock_manager)) continue;
                 break;
             case OP_OPEN:
-                if (open_create_handler(client, root, p, op)) continue;
+                if (open_create_handler(client, root, p, op, g_lock_manager)) continue;
                 break;
             case OP_READ:
-                if (read_handler(client, root, p)) continue;
+                if (read_handler(client, root, p, g_lock_manager)) continue;
                 break;
             case OP_WRITE:
             case OP_WRITE_BATCH: // <-- ADDED THIS CASE
                 // Server treats WRITE and WRITE_BATCH identically.
-                if (write_handler(client, root, p)) continue;
+                if (write_handler(client, root, p, g_lock_manager)) continue;
                 break;
             case OP_CREATE:
-                if (open_create_handler(client, root, p, op)) continue;
+                if (open_create_handler(client, root, p, op, g_lock_manager)) continue;
                 break;
             case OP_UNLINK:
-                if (unlink_handler(client, root, p)) continue;
+                if (unlink_handler(client, root, p, g_lock_manager)) continue;
                 break;
             case OP_MKDIR:
-                if (mkdir_handler(client, root, p)) continue;
+                if (mkdir_handler(client, root, p, g_lock_manager)) continue;
                 break;
             case OP_RMDIR:
-                if (rmdir_handler(client, root, p)) continue;
+                if (rmdir_handler(client, root, p, g_lock_manager)) continue;
                 break;
             case OP_TRUNCATE:
-                if (truncate_handler(client, root, p)) continue;
+                if (truncate_handler(client, root, p, g_lock_manager)) continue;
                 break;
             case OP_UTIMENS:
-                if (utimens_handler(client, root, p)) continue;
+                if (utimens_handler(client, root, p, g_lock_manager)) continue;
                 break;
             case OP_STATFS:
-                if (statfs_handler(client, root, p)) continue;
+                if (statfs_handler(client, root, p, g_lock_manager)) continue;
                 break;
             case OP_RELEASE:
-                if (release_handler(client, root, p)) continue;
+                if (release_handler(client, root, p, g_lock_manager)) continue;
                 break;
             default:
                 cerr << "Error: unknown opcode " << op << endl;
@@ -182,7 +185,7 @@ int main(int argc, char **argv) {
         // Create a new thread for each client
         // Pass root by value to avoid lifetime issues
         pool.enqueue([client, root]() {
-            handle_one(client, root); // handle client requests
+            handle_one(client, root, g_lock_manager); // handle client requests
             close(client);            // close client socket when done
             cout << "Client disconnected." << endl;
         });
