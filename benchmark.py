@@ -120,7 +120,7 @@ try:
 
                         # 2. Compile the code
                         print("Compiling...")
-                        compile_result = subprocess.run(["g++", "-o", "client", "client.cpp", "-lfuse3"], capture_output=True, text=True)
+                        compile_result = subprocess.run(["g++", "-o", "client", "./client/client.cpp", "-lfuse3"], capture_output=True, text=True)
                         if compile_result.returncode != 0:
                             print(f"Compile FAILED:\n{compile_result.stderr}")
                             continue  # Skip this test
