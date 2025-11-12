@@ -16,9 +16,11 @@ chunk_sizes = [
     # 4194304,     # 4 MB
     # 8388608      # 8 MB
 ]
-concurrent_connections = [ 
+concurrent_connections = [
+    # 2, 
     # 4,
-    8, 
+    8,
+    # 16, 
     # 16,
     # 32 ,
     ]
@@ -55,16 +57,16 @@ read_ahead_sizes = [
 #     # 8 * 1024 * 1024   # 8 MB
 # ]
 batch_write_thresholds = [
-    1024,
-    16*1024,
-    64 * 1024,
-    131072,    # 128 KB
-    262144,    # 256 KB
-    524288,    # 512 KB
+    # 1024,
+    # 16*1024,
+    # 64 * 1024,
+    # 131072,    # 128 KB
+    # 262144,    # 256 KB
+    # 524288,    # 512 KB
     1048576,    # 1 MB
-    4 * 1024 * 1024,   # 4 MB
-    8 * 1024 * 1024,   # 8 MB
-    16 * 1024 * 1024 ,  # 16 MB
+    # 4 * 1024 * 1024,   # 4 MB
+    # 8 * 1024 * 1024,   # 8 MB
+    # 16 * 1024 * 1024 ,  # 16 MB
 ]
 
 
@@ -109,7 +111,7 @@ try:
                         print(f"Chunk: {chunk_size}, Conns: {connections}, Cache: {cache_size}, ReadAhead: {read_ahead}, WriteThresh: {write_threshold}")
 
                         # 1. Write constants file
-                        with open("constants.cpp", "w") as f:
+                        with open("./client/constants.cpp", "w") as f:
                             f.write(f"#pragma once\n")
                             f.write(f"#define CHUNK_SIZE {chunk_size}\n")
                             f.write(f"#define POOL_SIZE {connections}\n")
@@ -120,14 +122,14 @@ try:
 
                         # 2. Compile the code
                         print("Compiling...")
-                        compile_result = subprocess.run(["g++", "-o", "client", "./client/client.cpp", "-lfuse3"], capture_output=True, text=True)
+                        compile_result = subprocess.run(["g++", "-o", "client.out", "./client/client.cpp", "-lfuse3"], capture_output=True, text=True)
                         if compile_result.returncode != 0:
                             print(f"Compile FAILED:\n{compile_result.stderr}")
                             continue  # Skip this test
 
                         # 3. Mount the client in the background
                         print("Mounting FUSE client...")
-                        client_process = subprocess.Popen(["./client", MOUNT_DIR, "10.7.14.140","3030"])
+                        client_process = subprocess.Popen(["./client.out", MOUNT_DIR, "10.7.44.227","3030"])
                         # Wait for mount to complete
                         time.sleep(2) 
 
@@ -169,7 +171,7 @@ try:
                             print(f"FIO test FAILED:\n{e.stderr}")
                         
                         finally:
-                            time.sleep(20)
+                            # time.sleep(20)
                             # # 5. Unmount and clean up
                             # print("Unmounting...")
                             # time.sleep(1) # Give time to unmount
