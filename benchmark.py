@@ -42,31 +42,29 @@ read_ahead_sizes = [
     # 8 * 1024 * 1024,   # 8 MB
     # 16 * 1024 * 1024   # 16 MB
 ]
+# batch_write_thresholds = [
+#     # 1024,
+#     # 16*1024,
+#     # 64 * 1024,
+#     131072,    # 128 KB
+#     262144,    # 256 KB
+#     524288,    # 512 KB
+#     1048576,    # 1 MB
+#     4 * 1024 * 1024,   # 4 MB
+
+#     # 8 * 1024 * 1024   # 8 MB
+# ]
 batch_write_thresholds = [
-    # 1024,
-    # 16*1024,
-    # 64 * 1024,
+    1024,
+    16*1024,
+    64 * 1024,
     131072,    # 128 KB
     262144,    # 256 KB
     524288,    # 512 KB
     1048576,    # 1 MB
     4 * 1024 * 1024,   # 4 MB
-
-    # 8 * 1024 * 1024   # 8 MB
-]
-batch_write_thresholds = [
-    # 1024,
-    # 16*1024,
-    # 64 * 1024,
-    # 131072,    # 128 KB
-    # 262144,    # 256 KB
-    # 524288,    # 512 KB
-    1048576,    # 1 MB
-    4 * 1024 * 1024,   # 4 MB
     8 * 1024 * 1024,   # 8 MB
-    16 * 1024 * 1024   # 16 MB
-    8 * 1024 * 1024,   # 8 MB
-    16 * 1024 * 1024   # 16 MB
+    16 * 1024 * 1024 ,  # 16 MB
 ]
 
 
@@ -129,13 +127,7 @@ try:
 
                         # 3. Mount the client in the background
                         print("Mounting FUSE client...")
-<<<<<<< Updated upstream
-                        client_process = subprocess.Popen(["./client", MOUNT_DIR, "10.7.44.227","3030"])
-                        
-=======
-                        client_process = subprocess.Popen(["./client", MOUNT_DIR, "192.168.223.177","3030"], shell=False)
-
->>>>>>> Stashed changes
+                        client_process = subprocess.Popen(["./client", MOUNT_DIR, "10.7.14.140","3030"])
                         # Wait for mount to complete
                         time.sleep(2) 
 
