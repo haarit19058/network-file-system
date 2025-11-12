@@ -1083,7 +1083,7 @@ static int nf_open(const char *path, struct fuse_file_info *fi)
 {
     cout << "FUSE: open(path=" << path << ", flags=" << fi->flags << ")" << endl;
     uint64_t serverfd = 0;
-    fi->direct_io = 0; // Tell FUSE we don't want its page caching
+    // fi->direct_io = 0; // Tell FUSE we don't want its page caching
     int r = do_open_or_create(path, fi->flags, 0644, false, serverfd);
     if (r < 0)
         return r;
@@ -1095,7 +1095,7 @@ static int nf_create(const char *path, mode_t mode, struct fuse_file_info *fi)
 {
     cout << "FUSE: create(path=" << path << ", mode=" << mode << ", flags=" << fi->flags << ")" << endl;
     uint64_t serverfd = 0;
-    fi->direct_io = 0;
+    // fi->direct_io = 0;
     int r = do_open_or_create(path, fi->flags, mode, true, serverfd);
     if (r < 0)
         return r;

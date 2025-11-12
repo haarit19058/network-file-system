@@ -1,0 +1,4 @@
+- cache_map stores mapping from path (key) to LRU list iterator,
+- LRU list has path and corresponding CacheValue
+- While putting a block with some path, if the path already exists in cache_map, identify the list iterator from map, overwrite the data present in the CacheValue pointed by list iterator, and move this list iterator to the front of list (Now it is most recently used)
+- If the path is not present in cache_map, 
