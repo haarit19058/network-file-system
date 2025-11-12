@@ -23,25 +23,54 @@ concurrent_connections = [
     # 32 ,
     ]
 cache_sizes = [
-    4 * 1024 * 1024,    # 4 MB
+    # 524288,    # 512 KB
+    # 1048576,    # 1 MB
+    4 * 1024 * 1024,   # 4 MB
+    # 8 * 1024 * 1024,   # 8 MB
     # 16 * 1024 * 1024,   # 16 MB
-    # 64 * 1024 * 1024,   # 64 MB
-    # 256 * 1024 * 1024   # 256 MB
+    # 32 * 1024 * 1024   # 16 MB
 ]
 read_ahead_sizes = [
+    # 1024,
+    # 16*1024,
+    # 64 * 1024,
+    131072,    # 128 KB
+    # 262144,    # 256 KB
+    # 524288,    # 512 KB
+    # 1048576,    # 1 MB
+    # 4 * 1024 * 1024,   # 4 MB
+    # 8 * 1024 * 1024,   # 8 MB
+    # 16 * 1024 * 1024   # 16 MB
+]
+batch_write_thresholds = [
+    # 1024,
+    # 16*1024,
+    # 64 * 1024,
     131072,    # 128 KB
     262144,    # 256 KB
     524288,    # 512 KB
     1048576,    # 1 MB
-    # 4 * 1024 * 1024,   # 4 MB
+    4 * 1024 * 1024,   # 4 MB
+<<<<<<< Updated upstream
     # 8 * 1024 * 1024   # 8 MB
 ]
 batch_write_thresholds = [
-    # 256 * 1024,    # 256 KB
-    512 * 1024,    # 512 KB
-    # 1 * 1024 * 1024,   # 1 MB
-    # 4 * 1024 * 1024    # 4 MB
+    # 1024,
+    # 16*1024,
+    # 64 * 1024,
+    131072,    # 128 KB
+    # 262144,    # 256 KB
+    # 524288,    # 512 KB
+    # 1048576,    # 1 MB
+    # 4 * 1024 * 1024,   # 4 MB
+    # 8 * 1024 * 1024,   # 8 MB
+    # 16 * 1024 * 1024   # 16 MB
+=======
+    8 * 1024 * 1024,   # 8 MB
+    16 * 1024 * 1024   # 16 MB
+>>>>>>> Stashed changes
 ]
+
 
 # Fixed parameter
 cache_block_size = 4096  # Fixed at 4 KB
@@ -89,7 +118,7 @@ try:
                             f.write(f"#define CHUNK_SIZE {chunk_size}\n")
                             f.write(f"#define POOL_SIZE {connections}\n")
                             f.write(f"#define CACHE_BLOCK_SIZE {cache_block_size}\n")
-                            f.write(f"#define CACHE_CAPACITY_BYTES {cache_size}\n")
+                            f.write(f"#define CACHE_CAPACITY_BYTES {cache_size}\n")     
                             f.write(f"#define READAHEAD_SIZE {read_ahead}\n")
                             f.write(f"#define BATCH_WRITE_THRESHOLD {write_threshold}\n")
 
@@ -102,8 +131,13 @@ try:
 
                         # 3. Mount the client in the background
                         print("Mounting FUSE client...")
-                        client_process = subprocess.Popen(["./client", MOUNT_DIR, "10.7.14.140","3030"])
+<<<<<<< Updated upstream
+                        client_process = subprocess.Popen(["./client", MOUNT_DIR, "10.7.44.227","3030"])
                         
+=======
+                        client_process = subprocess.Popen(["./client", MOUNT_DIR, "192.168.223.177","3030"], shell=False)
+
+>>>>>>> Stashed changes
                         # Wait for mount to complete
                         time.sleep(2) 
 
@@ -115,7 +149,7 @@ try:
                             print("Running FIO write test...")
                             fio_write_cmd = [
                                 "fio", "--name=nfs_write_test", f"--directory={MOUNT_DIR}",
-                                "--rw=write", "--size=10M", "--bs=1M", "--numjobs=1",
+                                "--rw=write", "--size=50M", "--bs=1M", "--numjobs=1",
                                 "--direct=1", "--runtime=10", "--time_based",
                                 "--output-format=json"
                             ]
@@ -130,7 +164,7 @@ try:
                             print("Running FIO read test...")
                             fio_read_cmd = [
                                 "fio", "--name=nfs_read_test", f"--directory={MOUNT_DIR}",
-                                "--rw=read", "--size=10M", "--bs=1M", "--numjobs=1",
+                                "--rw=read", "--size=50M", "--bs=1M", "--numjobs=1",
                                 "--direct=1", "--runtime=10", "--time_based",
                                 "--output-format=json"
                             ]
@@ -145,7 +179,7 @@ try:
                             print(f"FIO test FAILED:\n{e.stderr}")
                         
                         finally:
-                            # time.sleep(20)
+                            time.sleep(20)
                             # # 5. Unmount and clean up
                             # print("Unmounting...")
                             # time.sleep(1) # Give time to unmount
