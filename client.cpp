@@ -30,10 +30,11 @@
 #include <iostream>
 #include <algorithm>
 #include <condition_variable> // NEW: For the connection pool
+#include "constants.cpp"
 
 using namespace std;
 
-#define CHUNK_SIZE 131072 // 128 KB chunk size for network ops
+ // 128 KB chunk size for network ops
 
 // ----------------------------- Operation enum -----------------------------
 // This must match the enum in utils.cpp
@@ -168,14 +169,12 @@ static MetricLogger metrics; // Global metrics logger instance
 static std::vector<int> g_socket_pool;
 static std::mutex g_socket_pool_mtx;
 static std::condition_variable g_socket_pool_cv;
-static const int POOL_SIZE = 16; // 16 concurrent network connections
+// static const int POOL_SIZE = 16; // 16 concurrent network connections
 static const char *g_server_host = nullptr; // For reconnects
 static const char *g_server_port = nullptr; // For reconnects
 
 
 // ---------------------------- Caching parameters ---------------------------
-static const size_t CACHE_BLOCK_SIZE = 4096;                 // 4KB blocks
-static const size_t CACHE_CAPACITY_BYTES = 16 * 1024 * 1024; // 16 MB total cache
 static const chrono::seconds CACHE_TIMEOUT(10);              // 10-second cache timeout
 
 // ------------------------------- Cache types ------------------------------
@@ -349,7 +348,7 @@ static void attr_cache_invalidate(const string &path)
 }
 
 // --------------------------- Write Batching State --------------------------
-static const size_t BATCH_WRITE_THRESHOLD = 1 * 1024 * 1024; // 1 MB
+// static const size_t BATCH_WRITE_THRESHOLD = 1 * 1024 * 1024; // 1 MB
 static mutex g_write_buffer_mtx;
 // We use std::string as a dynamic byte buffer
 static unordered_map<uint64_t, string> g_write_buffers;
@@ -1084,7 +1083,7 @@ static int nf_open(const char *path, struct fuse_file_info *fi)
 {
     cout << "FUSE: open(path=" << path << ", flags=" << fi->flags << ")" << endl;
     uint64_t serverfd = 0;
-    fi->direct_io = 1; // Tell FUSE we don't want its page caching
+    fi->direct_io = 0; // Tell FUSE we don't want its page caching
     int r = do_open_or_create(path, fi->flags, 0644, false, serverfd);
     if (r < 0)
         return r;
@@ -1096,7 +1095,7 @@ static int nf_create(const char *path, mode_t mode, struct fuse_file_info *fi)
 {
     cout << "FUSE: create(path=" << path << ", mode=" << mode << ", flags=" << fi->flags << ")" << endl;
     uint64_t serverfd = 0;
-    fi->direct_io = 1;
+    fi->direct_io = 0;
     int r = do_open_or_create(path, fi->flags, mode, true, serverfd);
     if (r < 0)
         return r;
@@ -1148,14 +1147,14 @@ static int nf_read(const char *path, char *buf, size_t size, off_t offset, struc
             // starting from the beginning of the block that was missed.
             // This pre-fetches subsequent blocks for future reads.
             off_t readahead_offset = block_start_offset;
-            size_t readahead_size = CHUNK_SIZE; // Always ask for 128KB
+            // size_t READAHEAD_SIZE = CHUNK_SIZE; // Always ask for 128KB
 
-            cout << "  Aggressive Re-ahead: requesting " << readahead_size << " bytes from offset " << readahead_offset << endl;
+            cout << "  Aggressive Re-ahead: requesting " << READAHEAD_SIZE << " bytes from offset " << readahead_offset << endl;
 
-            vector<char> readahead_buf(readahead_size);
+            vector<char> readahead_buf(READAHEAD_SIZE);
             size_t server_got = 0;
 
-            int rr = do_read(serverfd, readahead_buf.data(), readahead_size, readahead_offset, &server_got);
+            int rr = do_read(serverfd, readahead_buf.data(), READAHEAD_SIZE, readahead_offset, &server_got);
             if (rr < 0) return rr;
             if (server_got == 0) break; // EOF
 
@@ -1165,7 +1164,7 @@ static int nf_read(const char *path, char *buf, size_t size, off_t offset, struc
             uint64_t current_block_idx = b;
             while (bytes_cached < server_got)
             {
-                size_t chunk_to_cache = min(CACHE_BLOCK_SIZE, server_got - bytes_cached);
+                size_t chunk_to_cache = min(CACHE_BLOCK_SIZE,(int)(server_got - bytes_cached));
                 string current_key = make_block_key(spath, current_block_idx);
                 
                 cout << "  Populating cache for key=" << current_key << " len=" << chunk_to_cache << endl;
