@@ -17,7 +17,7 @@
 #include <dirent.h>
 #include <errno.h>
 #include <sys/statvfs.h>
-#include <endian.h> // htobe64 / be64toh
+#include <endian.h>    // htobe64 / be64toh
 #include "rwlocks.cpp" // For RWLockManager
 
 // Note: std:: is used explicitly to avoid "using namespace std;" in an included file.
@@ -58,10 +58,12 @@ static int readn(int fd, void *buf, size_t n)
         ssize_t r = ::read(fd, p, left);
         if (r < 0)
         {
-            if (errno == EINTR) continue;
+            if (errno == EINTR)
+                continue;
             return -1; // Error
         }
-        if (r == 0) return 0; // EOF
+        if (r == 0)
+            return 0; // EOF
         left -= r;
         p += r;
     }
@@ -78,10 +80,12 @@ static int writen(int fd, const void *buf, size_t n)
         ssize_t w = ::write(fd, p, left);
         if (w < 0)
         {
-            if (errno == EINTR) continue;
+            if (errno == EINTR)
+                continue;
             return -1; // Error
         }
-        if (w == 0) return 0; // Should not happen
+        if (w == 0)
+            return 0; // Should not happen
         left -= w;
         p += w;
     }
@@ -133,9 +137,10 @@ static void send_ok_with_data(int client, const void *data, uint32_t dlen)
 int getattr_handler(int client, const string &root, const char *p, RWLockManager &lock_manager)
 {
     uint32_t pathlen;
-    memcpy(&pathlen, p, 4); p += 4;
+    memcpy(&pathlen, p, 4);
+    p += 4;
     pathlen = ntohl(pathlen);
-    
+
     string path(p, p + pathlen);
     string full = joinpath(root, path);
 
@@ -158,14 +163,15 @@ int getattr_handler(int client, const string &root, const char *p, RWLockManager
 int readdir_handler(int client, const string &root, const char *p, RWLockManager &lock_manager)
 {
     uint32_t pathlen;
-    memcpy(&pathlen, p, 4); p += 4;
+    memcpy(&pathlen, p, 4);
+    p += 4;
     pathlen = ntohl(pathlen);
 
     string path(p, p + pathlen);
     string full = joinpath(root, path);
 
     std::shared_lock<std::shared_mutex> lock = lock_manager.acquire_read_lock(full);
-    
+
     DIR *d = opendir(full.c_str());
     if (!d)
     {
@@ -196,13 +202,16 @@ int readdir_handler(int client, const string &root, const char *p, RWLockManager
 int open_create_handler(int client, const string &root, const char *p, int op, RWLockManager &lock_manager)
 {
     uint32_t pathlen;
-    memcpy(&pathlen, p, 4); p += 4;
+    memcpy(&pathlen, p, 4);
+    p += 4;
     pathlen = ntohl(pathlen);
 
-    string path(p, p + pathlen); p += pathlen;
+    string path(p, p + pathlen);
+    p += pathlen;
 
     uint32_t flags;
-    memcpy(&flags, p, 4); p += 4;
+    memcpy(&flags, p, 4);
+    p += 4;
     flags = ntohl(flags);
 
     string full = joinpath(root, path);
@@ -212,7 +221,8 @@ int open_create_handler(int client, const string &root, const char *p, int op, R
     if (op == OP_CREATE)
     {
         uint32_t mode;
-        memcpy(&mode, p, 4); p += 4;
+        memcpy(&mode, p, 4);
+        p += 4;
         mode = ntohl(mode);
         fd = open(full.c_str(), (int)flags | O_CREAT, (mode_t)mode);
     }
@@ -233,6 +243,20 @@ int open_create_handler(int client, const string &root, const char *p, int op, R
     return 0;
 }
 
+std::string getPathFromFd(uint64_t fd)
+{
+    std::vector<char> buf(1024);
+    std::string path = "/proc/self/fd/" + std::to_string(fd);
+
+    ssize_t len = readlink(path.c_str(), buf.data(), buf.size() - 1);
+    if (len == -1)
+    {
+        return ""; // error
+    }
+    buf[len] = '\0';
+    return std::string(buf.data());
+}
+
 // ---------------------- 4) OP_READ ---------------------------------------
 // Request: [ 8b sfd | 8b offset | 4b size ]
 // Response: [ data (up to size bytes) ]
@@ -242,32 +266,40 @@ int read_handler(int client, const string &root, const char *p, RWLockManager &l
     (void)root; // unused
 
     uint64_t sfd;
-    memcpy(&sfd, p, 8); p += 8;
+    memcpy(&sfd, p, 8);
+    p += 8;
     sfd = be64toh(sfd);
 
     uint64_t off;
-    memcpy(&off, p, 8); p += 8;
+    memcpy(&off, p, 8);
+    p += 8;
     off = be64toh(off);
 
     uint32_t size;
-    memcpy(&size, p, 4); p += 4;
+    memcpy(&size, p, 4);
+    p += 4;
     size = ntohl(size);
-    
-    if (size == 0) {
+
+    if (size == 0)
+    {
         send_ok_with_data(client, nullptr, 0);
         return 0;
     }
 
     // Client chunks requests, but good to double-check
     // if (size > CHUNK_SIZE) {
-    //     size = CHUNK_SIZE; 
+    //     size = CHUNK_SIZE;
     // }
-    std::shared_lock<std::shared_mutex> lock = lock_manager.acquire_read_lock(p);
+    std::string path = getPathFromFd(sfd);
+    if (path == "")
+        return 1;
+    std::shared_lock<std::shared_mutex> lock = lock_manager.acquire_read_lock(path);
 
     vector<char> buf(size);
     ssize_t r = pread((int)sfd, buf.data(), size, (off_t)off);
-    
-    if (r < 0) {
+
+    if (r < 0)
+    {
         send_errno(client, errno);
         return 1;
     }
@@ -278,6 +310,24 @@ int read_handler(int client, const string &root, const char *p, RWLockManager &l
     return 0;
 }
 
+#include <chrono>
+#include <ctime>
+#include <iomanip>
+
+std::string timestamp() {
+    using namespace std::chrono;
+
+    auto now = system_clock::now();
+    auto in_time_t = system_clock::to_time_t(now);
+    auto ms = duration_cast<milliseconds>(now.time_since_epoch()) % 1000;
+
+    std::stringstream ss;
+    ss << std::put_time(std::localtime(&in_time_t), "%H:%M:%S")
+       << "." << std::setfill('0') << std::setw(3) << ms.count();
+    return ss.str();
+}
+
+
 // ---------------------- 5) OP_WRITE & 14) OP_WRITE_BATCH -----------------
 // Request: [ 8b sfd | 8b offset | 4b size | data ]
 // Response: [ 4b bytes_written ]
@@ -287,28 +337,56 @@ int write_handler(int client, const string &root, const char *p, RWLockManager &
     (void)root; // unused
 
     uint64_t sfd;
-    memcpy(&sfd, p, 8); p += 8;
+    memcpy(&sfd, p, 8);
+    p += 8;
     sfd = be64toh(sfd);
 
     uint64_t off;
-    memcpy(&off, p, 8); p += 8;
+    memcpy(&off, p, 8);
+    p += 8;
     off = be64toh(off);
 
     uint32_t wsize;
-    memcpy(&wsize, p, 4); p += 4;
+    memcpy(&wsize, p, 4);
+    p += 4;
     wsize = ntohl(wsize);
-    
+
     // Data immediately follows the header
-    const char *data = p; 
+    const char *data = p;
 
     // Client should chunk, but we double-check
-    if (wsize > CHUNK_SIZE) { 
+    if (wsize > CHUNK_SIZE)
+    {
         wsize = CHUNK_SIZE;
     }
-    std::unique_lock<std::shared_mutex> lock = lock_manager.acquire_write_lock(p);
-    ssize_t w = pwrite((int)sfd, data, wsize, (off_t)off);
+
+   
+    std::cerr << "ENTER write handler for fd=" << sfd << "\n";
+
+    std::string path = getPathFromFd(sfd);
+    std::cerr << "Path resolved: [" << path << "]\n";
+
+    if (path == "") {
+        std::cerr << "ERROR: Could not get path for fd=" << sfd 
+                << " errno=" << errno << "\n";
+        return 1;
+    }
+
+    std::cerr << "[" << timestamp() << "]" << std::endl;
+    std::cerr << "Before lock\n";
+    std::unique_lock<std::shared_mutex> lock = lock_manager.acquire_write_lock(path);
     
-    if (w == -1) {
+    std::cerr << "After lock\n";
+    std::cout << "PATH PRINT: " << path << std::endl;
+    std::cout << "Client: " << client << " acquired write lock at offset " 
+            << off << " size " << wsize << std::endl;
+
+    ssize_t w = pwrite((int)sfd, data, wsize, (off_t)off);
+    std::cerr << "pwrite returned: " << w << "\n";
+
+
+    if (w == -1)
+    {
         send_errno(client, errno);
         return 1;
     }
@@ -325,7 +403,8 @@ int write_handler(int client, const string &root, const char *p, RWLockManager &
 int unlink_handler(int client, const string &root, const char *p, RWLockManager &lock_manager)
 {
     uint32_t pathlen;
-    memcpy(&pathlen, p, 4); p += 4;
+    memcpy(&pathlen, p, 4);
+    p += 4;
     pathlen = ntohl(pathlen);
     string path(p, p + pathlen);
     string full = joinpath(root, path);
@@ -346,12 +425,15 @@ int unlink_handler(int client, const string &root, const char *p, RWLockManager 
 int mkdir_handler(int client, const string &root, const char *p, RWLockManager &lock_manager)
 {
     uint32_t pathlen;
-    memcpy(&pathlen, p, 4); p += 4;
+    memcpy(&pathlen, p, 4);
+    p += 4;
     pathlen = ntohl(pathlen);
-    string path(p, p + pathlen); p += pathlen;
+    string path(p, p + pathlen);
+    p += pathlen;
 
     uint32_t mode;
-    memcpy(&mode, p, 4); p += 4;
+    memcpy(&mode, p, 4);
+    p += 4;
     mode = ntohl(mode);
 
     string full = joinpath(root, path);
@@ -371,12 +453,12 @@ int mkdir_handler(int client, const string &root, const char *p, RWLockManager &
 int rmdir_handler(int client, const string &root, const char *p, RWLockManager &lock_manager)
 {
     uint32_t pathlen;
-    memcpy(&pathlen, p, 4); p += 4;
+    memcpy(&pathlen, p, 4);
+    p += 4;
     pathlen = ntohl(pathlen);
     string path(p, p + pathlen);
     string full = joinpath(root, path);
     std::unique_lock<std::shared_mutex> lock = lock_manager.acquire_write_lock(full);
-
     if (rmdir(full.c_str()) == -1)
     {
         send_errno(client, errno);
@@ -392,12 +474,15 @@ int rmdir_handler(int client, const string &root, const char *p, RWLockManager &
 int truncate_handler(int client, const string &root, const char *p, RWLockManager &lock_manager)
 {
     uint32_t pathlen;
-    memcpy(&pathlen, p, 4); p += 4;
+    memcpy(&pathlen, p, 4);
+    p += 4;
     pathlen = ntohl(pathlen);
-    string path(p, p + pathlen); p += pathlen;
+    string path(p, p + pathlen);
+    p += pathlen;
 
     uint64_t size;
-    memcpy(&size, p, 8); p += 8;
+    memcpy(&size, p, 8);
+    p += 8;
     size = be64toh(size);
 
     string full = joinpath(root, path);
@@ -417,15 +502,25 @@ int truncate_handler(int client, const string &root, const char *p, RWLockManage
 int utimens_handler(int client, const string &root, const char *p, RWLockManager &lock_manager)
 {
     uint32_t pathlen;
-    memcpy(&pathlen, p, 4); p += 4;
+    memcpy(&pathlen, p, 4);
+    p += 4;
     pathlen = ntohl(pathlen);
-    string path(p, p + pathlen); p += pathlen;
+    string path(p, p + pathlen);
+    p += pathlen;
 
     uint64_t at_sec, at_nsec, mt_sec, mt_nsec;
-    memcpy(&at_sec, p, 8); p += 8; at_sec = be64toh(at_sec);
-    memcpy(&at_nsec, p, 8); p += 8; at_nsec = be64toh(at_nsec);
-    memcpy(&mt_sec, p, 8); p += 8; mt_sec = be64toh(mt_sec);
-    memcpy(&mt_nsec, p, 8); p += 8; mt_nsec = be64toh(mt_nsec);
+    memcpy(&at_sec, p, 8);
+    p += 8;
+    at_sec = be64toh(at_sec);
+    memcpy(&at_nsec, p, 8);
+    p += 8;
+    at_nsec = be64toh(at_nsec);
+    memcpy(&mt_sec, p, 8);
+    p += 8;
+    mt_sec = be64toh(mt_sec);
+    memcpy(&mt_nsec, p, 8);
+    p += 8;
+    mt_nsec = be64toh(mt_nsec);
 
     struct timespec times[2];
     times[0].tv_sec = (time_t)at_sec;
@@ -450,7 +545,8 @@ int utimens_handler(int client, const string &root, const char *p, RWLockManager
 int statfs_handler(int client, const string &root, const char *p, RWLockManager &lock_manager)
 {
     uint32_t pathlen;
-    memcpy(&pathlen, p, 4); p += 4;
+    memcpy(&pathlen, p, 4);
+    p += 4;
     pathlen = ntohl(pathlen);
     string path(p, p + pathlen);
     string full = joinpath(root, path);
@@ -477,9 +573,10 @@ int release_handler(int client, const string &root, const char *p, RWLockManager
 
     std::shared_lock<std::shared_mutex> lock = lock_manager.acquire_read_lock(p);
 
-    memcpy(&sfd, p, 8); p += 8;
+    memcpy(&sfd, p, 8);
+    p += 8;
     sfd = be64toh(sfd);
-    
+
     close((int)sfd); // Close the file descriptor
 
     send_ok_with_data(client, nullptr, 0);
