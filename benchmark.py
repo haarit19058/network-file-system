@@ -17,8 +17,9 @@ chunk_sizes = [
     # 8388608      # 8 MB
 ]
 concurrent_connections = [
-    # 2, 
-    # 4,
+    1,
+    2, 
+    4,
     8,
     # 16, 
     # 16,
@@ -129,7 +130,7 @@ try:
 
                         # 3. Mount the client in the background
                         print("Mounting FUSE client...")
-                        client_process = subprocess.Popen(["./client.out", MOUNT_DIR, "10.7.44.227","3030"])
+                        client_process = subprocess.Popen(["./client.out", MOUNT_DIR, "10.7.27.8","3030"])
                         # Wait for mount to complete
                         time.sleep(2) 
 
